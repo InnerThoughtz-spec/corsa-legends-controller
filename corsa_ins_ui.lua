@@ -62,6 +62,10 @@ local uiLoader = assert(loadstring(uiSource))
 local Lib = uiLoader() or INSui
 local MPH_PER_STUD_PER_SECOND = 0.626342
 local SWERVE_MAX_MPH = 370
+local MICRO_SWERVE_MAX_WIDTH = 1.75
+local MICRO_SWERVE_MAX_HOLD = 0.18
+local SWERVE_MAX_LATERAL_SPEED = 6
+local SWERVE_MAX_LATERAL_ACCELERATION = 36
 
 local State = {
     enabled = true,
@@ -107,14 +111,18 @@ local State = {
     swerveTargetMPH = SWERVE_MAX_MPH,
     swerveSpeed = SWERVE_MAX_MPH / MPH_PER_STUD_PER_SECOND,
     swerveAcceleration = 150,
-    swerveLaneSpeed = 14,
-    swerveLaneAcceleration = 72,
+    swerveLaneSpeed = 6,
+    swerveLaneAcceleration = 36,
     microSwerveEnabled = true,
-    microSwerveWidth = 3.5,
-    microSwerveHold = 0.30,
-    microSwervePause = 0.80,
+    microSwerveWidth = 1.25,
+    microSwerveHold = 0.15,
+    microSwervePause = 1.00,
+    microSwerveLateralSpeed = 3.0,
+    microSwerveAcceleration = 18,
     microSwervePhase = "center",
     microSwerveCount = 0,
+    avoidLeftRail = true,
+    targetLane = 2,
     trafficNoCollision = true,
     trafficDetected = 0,
     trafficAhead = math.huge,
@@ -132,6 +140,12 @@ local State = {
     serverGhostResets = 0,
     autoRetry = true,
     retryCount = 0,
+    retryArmed = false,
+    retryReason = "monitoring",
+    autoPayout = true,
+    autoPayoutScore = 2000000,
+    payoutCycles = 0,
+    payoutInProgress = false,
 
     antiAfk = true,
     antiAfkInterval = 55,
@@ -155,6 +169,8 @@ local swerveMicroOffset = 0
 local swerveMicroDirection = 1
 local swerveMicroReturnAt = 0
 local swerveMicroNextAt = 0
+local swerveMicroRecoverUntil = 0
+local swerveMicroNeedsRecovery = false
 local swerveLanes = { 4805.187, 4821.565, 4837.794 }
 local swerveStartZ = 19215
 local swerveForward = Vector3.new(0, 0, 1)
@@ -170,13 +186,17 @@ local detachedTrafficProxyAddresses = {}
 local removedServerGhostIds = {}
 local lastCharacterSpeed
 local lastCrashGuardWrite = 0
+local lastRetryClick = 0
+local lastObservedSwerveScore = 0
+local retryArmedUntil = 0
+local retryDetectionSuppressedUntil = 0
 
 local win = Lib:CreateWindow({
     title = "Corsa Controller",
-    subtitle = "stable chassis + Swerve v17",
+    subtitle = "stable chassis + Swerve v19",
     size = Vector2.new(720, 540),
     menuKey = "p",
-    configName = "corsa-controller-v17",
+    configName = "corsa-controller-v19",
     configFolder = "corsa-controller",
     accentA = Color3.fromRGB(84, 168, 255),
     accentB = Color3.fromRGB(105, 255, 202),
@@ -434,12 +454,16 @@ local function enterSwerveCourse(notifyUser)
     currentRoot = root
 
     resolveSwerveCourse()
-    -- Lock the lane the player started in. Traffic never changes this target.
-    swerveLane = nearestSwerveLane(root.Position.X)
+    -- The center/right lanes keep the farm away from the trash-lined left rail.
+    local detectedLane = nearestSwerveLane(root.Position.X)
+    swerveLane = State.avoidLeftRail and math.max(2, detectedLane) or detectedLane
+    State.targetLane = swerveLane
     swerveMicroOffset = 0
     swerveMicroDirection = 1
     swerveMicroReturnAt = 0
     swerveMicroNextAt = tick() + 0.60
+    swerveMicroRecoverUntil = 0
+    swerveMicroNeedsRecovery = false
     State.microSwervePhase = "center"
     State.microSwerveCount = 0
     swerveFaulted = false
@@ -452,6 +476,11 @@ local function enterSwerveCourse(notifyUser)
     end
 
     swerveCarAddress = car.Address
+    retryArmedUntil = 0
+    retryDetectionSuppressedUntil = tick() + 2.5
+    lastObservedSwerveScore = 0
+    State.retryArmed = false
+    State.retryReason = "monitoring"
     if notifyUser then
         Lib:Notify("Swerve", "Autofarm initialized at the car's current position", 3, "success")
     end
@@ -460,7 +489,9 @@ end
 
 local function stabilizeSwerveCar(root)
     if not root then return end
-    swerveLane = nearestSwerveLane(root.Position.X)
+    local detectedLane = nearestSwerveLane(root.Position.X)
+    swerveLane = State.avoidLeftRail and math.max(2, detectedLane) or detectedLane
+    State.targetLane = swerveLane
     pcall(function()
         local velocity = root.AssemblyLinearVelocity
         root.AssemblyLinearVelocity = Vector3.new(
@@ -480,6 +511,8 @@ end
 _G.__CorsaStopSwerve = function()
     State.swerveEnabled = false
     swerveMicroOffset = 0
+    swerveMicroRecoverUntil = 0
+    swerveMicroNeedsRecovery = false
     State.microSwervePhase = "center"
     if _G.__CorsaRestoreWheels then pcall(_G.__CorsaRestoreWheels) end
     Lib:Notify("Swerve", "autofarm stopped", 2, "warning")
@@ -522,6 +555,8 @@ local function updateMicroSwerve()
     local now = tick()
     if not (State.swerveEnabled and State.microSwerveEnabled) then
         swerveMicroOffset = 0
+        swerveMicroRecoverUntil = 0
+        swerveMicroNeedsRecovery = false
         State.microSwervePhase = "center"
         swerveMicroNextAt = now + State.microSwervePause
         return 0
@@ -530,13 +565,15 @@ local function updateMicroSwerve()
     if swerveMicroOffset ~= 0 then
         if now >= swerveMicroReturnAt then
             swerveMicroOffset = 0
+            swerveMicroRecoverUntil = now + 0.35
             State.microSwervePhase = "center"
             swerveMicroNextAt = now + State.microSwervePause
         end
-    elseif now >= swerveMicroNextAt then
+    elseif now >= swerveMicroNextAt and not swerveMicroNeedsRecovery then
         local direction = chooseMicroSwerveDirection()
         swerveMicroOffset = direction * State.microSwerveWidth
         swerveMicroReturnAt = now + State.microSwerveHold
+        swerveMicroNeedsRecovery = true
         State.microSwervePhase = direction < 0 and "A tap" or "D tap"
         State.microSwerveCount = State.microSwerveCount + 1
     end
@@ -788,10 +825,14 @@ local function enforceCrashGuard()
     if stableSpeed < 30 then return end
 
     local velocity = root.AssemblyLinearVelocity
+    local guardLateralLimit = math.min(
+        State.swerveLaneSpeed,
+        SWERVE_MAX_LATERAL_SPEED
+    )
     local lateral = clamp(
         velocity.X,
-        -State.swerveLaneSpeed,
-        State.swerveLaneSpeed
+        -guardLateralLimit,
+        guardLateralLimit
     )
     local forward = math.sqrt(math.max(0, stableSpeed * stableSpeed - lateral * lateral))
     local guardedVelocity = Vector3.new(lateral, 0, forward)
@@ -854,30 +895,76 @@ local function getSwerveGui()
     return purchase and purchase:FindFirstChild("HesiUI")
 end
 
-local function clickSwerveRetry()
-    if not State.autoRetry then return false end
+local guiObjectClasses = {
+    Frame = true,
+    ScrollingFrame = true,
+    TextLabel = true,
+    TextButton = true,
+    TextBox = true,
+    ImageLabel = true,
+    ImageButton = true,
+    VideoFrame = true,
+    ViewportFrame = true,
+}
 
-    local hesi = getSwerveGui()
-    local failed = hesi and hesi:FindFirstChild("Fail")
-    local retry = hesi and hesi:FindFirstChild("Retry")
-    if not (failed and failed.Value == true and retry) then return false end
+local function retryIsOnScreen(retry)
+    if not retry then return false end
+
+    local node = retry
+    while node do
+        local className = node.ClassName
+        if guiObjectClasses[className] then
+            local visible = node.Visible
+            if visible == false then return false end
+        elseif className == "ScreenGui" and node.Enabled == false then
+            return false
+        end
+        node = node.Parent
+    end
 
     local position = retry.AbsolutePosition
     local size = retry.AbsoluteSize
     if not position or not size or size.X < 2 or size.Y < 2 then return false end
 
+    local camera = game.Workspace.CurrentCamera
+    local viewport = camera and camera.ViewportSize
+    if not viewport then return true end
+
+    local centerX = position.X + size.X * 0.5
+    local centerY = position.Y + size.Y * 0.5
+    return centerX >= 0 and centerX <= viewport.X
+        and centerY >= 0 and centerY <= viewport.Y
+end
+
+local function clickRetryButton(retry)
+    local position = retry.AbsolutePosition
+    local size = retry.AbsoluteSize
     local mouse = player:GetMouse()
     local oldX = mouse and mouse.X
     local oldY = mouse and mouse.Y
+
     local clicked = false
-    local clickOk = pcall(function()
+    local ok = pcall(function()
         mousemoveabs(position.X + size.X * 0.5, position.Y + size.Y * 0.5)
         mouse1click()
         clicked = true
         if oldX and oldY then mousemoveabs(oldX, oldY) end
     end)
-    if not clickOk or not clicked then return false end
+    return ok and clicked
+end
 
+local function clickSwerveRetry(force)
+    if not State.autoRetry then return false end
+    if State.payoutInProgress then return false end
+    if not force and tick() >= retryArmedUntil then return false end
+    if tick() - lastRetryClick < 0.75 then return false end
+
+    local hesi = getSwerveGui()
+    local retry = hesi and hesi:FindFirstChild("Retry")
+    if not retryIsOnScreen(retry) then return false end
+    if not clickRetryButton(retry) then return false end
+
+    lastRetryClick = tick()
     State.retryCount = State.retryCount + 1
     State.enabled = true
     State.swerveEnabled = true
@@ -889,11 +976,117 @@ local function clickSwerveRetry()
         end
     end)
 
+    -- Some high-score Retry animations briefly swallow the first click.
+    task.delay(0.18, function()
+        if _G.__CorsaBoostToken == token and retryIsOnScreen(retry) then
+            clickRetryButton(retry)
+        end
+    end)
+
     Lib:Notify("Swerve", "Retry clicked; autofarm resumed", 2, "success")
     return true
 end
 
-_G.__CorsaRetrySwerve = clickSwerveRetry
+_G.__CorsaRetrySwerve = function()
+    return clickSwerveRetry(true)
+end
+
+local function readSwerveScore()
+    local hesi = getSwerveGui()
+    local score = hesi and hesi:FindFirstChild("Score")
+    if not score then return 0 end
+    return tonumber((tostring(score.Text):gsub("[^%d%-]", ""))) or 0
+end
+
+local function updateRetryArm()
+    local score = readSwerveScore()
+    if tick() < retryDetectionSuppressedUntil then
+        lastObservedSwerveScore = score
+        retryArmedUntil = 0
+        State.retryArmed = false
+        State.retryReason = "restart settling"
+        return
+    end
+    if State.payoutInProgress then
+        lastObservedSwerveScore = score
+        retryArmedUntil = 0
+        State.retryArmed = false
+        State.retryReason = "2M payout"
+        return
+    end
+
+    local hesi = getSwerveGui()
+    local failed = hesi and hesi:FindFirstChild("Fail")
+    local failPulse = failed and failed.Value == true
+    local scoreCollapsed = lastObservedSwerveScore >= 5000 and score <= 250
+
+    if failPulse or scoreCollapsed then
+        retryArmedUntil = tick() + 2.5
+        State.retryReason = failPulse and "Fail signal" or "score reset detected"
+    end
+
+    if score > lastObservedSwerveScore then
+        lastObservedSwerveScore = score
+    end
+    State.retryArmed = tick() < retryArmedUntil
+end
+
+local function cycleSwervePayout(force)
+    if not State.swerveEnabled then return false end
+    if not (force or State.autoPayout) then return false end
+    if State.payoutInProgress then return false end
+    if not force and readSwerveScore() < State.autoPayoutScore then return false end
+
+    State.payoutInProgress = true
+    task.spawn(function()
+        local finalize = getSwerveRemote("SwerveFinalize")
+        local scoreStop = getSwerveRemote("ScoreStop")
+        local heliStop = getSwerveRemote("HeliStop")
+
+        if finalize then
+            pcall(function() finalize:FireServer("EndMinigame") end)
+        end
+        task.wait(0.12)
+        if scoreStop then
+            pcall(function() scoreStop:FireServer("EndRun") end)
+        end
+        if heliStop then
+            pcall(function() heliStop:FireServer() end)
+        end
+
+        task.wait(0.75)
+        local restarted = false
+        for _ = 1, 6 do
+            if _G.__CorsaBoostToken ~= token then return end
+            if enterSwerveCourse(false) then
+                restarted = true
+                break
+            end
+            task.wait(0.50)
+        end
+
+        if restarted then
+            State.payoutCycles = State.payoutCycles + 1
+            Lib:Notify(
+                "Swerve payout",
+                "2,000,000-point run cashed out; next run started",
+                3,
+                "success"
+            )
+        else
+            Lib:Notify(
+                "Swerve payout",
+                "Run cashed out; waiting for a valid driver seat to restart",
+                4,
+                "warning"
+            )
+        end
+        State.payoutInProgress = false
+    end)
+    return true
+end
+
+_G.__CorsaCashOutSwerve = cycleSwervePayout
 
 local function captureCar(car)
     restorePlayerWheels()
@@ -1089,7 +1282,7 @@ super:Button("Apply supercharger tune", function()
 end)
 
 local automation = win:Tab("Automation", "settings")
-local swerve = automation:Section("Swerve autofarm", "Left", "fixed-lane traffic phasing")
+local swerve = automation:Section("Swerve autofarm", "Left", "safe-lane traffic phasing")
 
 swerve:Toggle("Autofarm enabled", false, function(on)
     State.swerveEnabled = on
@@ -1114,29 +1307,39 @@ end)
 swerve:Slider("Acceleration", 150, 5, 30, 240, "", function(v)
     State.swerveAcceleration = v
 end)
-swerve:Slider("Lane centering speed", 14, 1, 8, 24, "", function(v)
-    State.swerveLaneSpeed = v
+swerve:Slider("Lane centering speed", 6, 0.5, 3, 6, "", function(v)
+    State.swerveLaneSpeed = math.min(v, SWERVE_MAX_LATERAL_SPEED)
 end)
-swerve:Slider("Lane centering brake", 72, 2, 30, 100, "", function(v)
-    State.swerveLaneAcceleration = v
+swerve:Slider("Lane centering brake", 36, 2, 18, 36, "", function(v)
+    State.swerveLaneAcceleration = math.min(v, SWERVE_MAX_LATERAL_ACCELERATION)
+end)
+swerve:Toggle("Avoid left guard rail", true, function(on)
+    State.avoidLeftRail = on
+    if on and swerveLane < 2 then swerveLane = 2 end
+    State.targetLane = swerveLane
 end)
 swerve:Toggle("Micro-swerve taps", true, function(on)
     State.microSwerveEnabled = on
     if not on then
         swerveMicroOffset = 0
+        swerveMicroRecoverUntil = 0
+        swerveMicroNeedsRecovery = false
         State.microSwervePhase = "center"
     end
 end)
-swerve:Slider("Tap width", 3.5, 0.25, 1, 6, " studs", function(v)
-    State.microSwerveWidth = v
+swerve:Slider("Light tap width", 1.25, 0.25, 0.5, 1.75, " studs", function(v)
+    State.microSwerveWidth = math.min(v, MICRO_SWERVE_MAX_WIDTH)
 end)
-swerve:Slider("Tap hold", 0.30, 0.05, 0.15, 0.60, "s", function(v)
-    State.microSwerveHold = v
+swerve:Slider("Light tap hold", 0.15, 0.01, 0.08, 0.18, "s", function(v)
+    State.microSwerveHold = math.min(v, MICRO_SWERVE_MAX_HOLD)
 end)
-swerve:Slider("Time between taps", 0.80, 0.05, 0.35, 2.0, "s", function(v)
+swerve:Slider("Tap strength", 3.0, 0.25, 1.5, 4.0, "", function(v)
+    State.microSwerveLateralSpeed = math.min(v, 4.0)
+end)
+swerve:Slider("Time between taps", 1.00, 0.05, 0.60, 2.0, "s", function(v)
     State.microSwervePause = v
 end)
-swerve:Info("Micro-swerve mode keeps the selected lane, then makes short A/D-style nudges toward nearby traffic before returning to center.")
+swerve:Info("Light-tap mode adds a brief, low-strength A/D nudge and eases back to lane center. It never performs a full lane change.")
 swerve:Button("Initialize from current position", function()
     _G.__CorsaStartSwerve()
 end)
@@ -1148,6 +1351,15 @@ swerve:Button("Stabilize current lane", function()
 end)
 swerve:Toggle("Auto-click Retry", true, function(on)
     State.autoRetry = on
+end)
+swerve:Toggle("Auto cash-out at 2M", true, function(on)
+    State.autoPayout = on
+end)
+swerve:Button("Cash out and restart now", function()
+    local started = cycleSwervePayout(true)
+    if not started then
+        Lib:Notify("Swerve payout", "A payout cycle is already running", 2, "warning")
+    end
 end)
 swerve:Toggle("Crash detector guard", true, function(on)
     State.crashGuard = on
@@ -1161,7 +1373,7 @@ swerve:Slider("Server ghost cutoff", 100, 5, 60, 160, " studs", function(v)
     State.serverGhostCutoff = v
 end)
 swerve:Button("Click Retry now", function()
-    if not clickSwerveRetry() then
+    if not clickSwerveRetry(true) then
         Lib:Notify("Swerve", "Retry screen is not active", 2, "warning")
     end
 end)
@@ -1186,6 +1398,7 @@ swerve:Button("Reset server traffic ghosts", function()
 end)
 swerve:Label(function()
     return "Target lane: " .. tostring(swerveLane)
+        .. (State.avoidLeftRail and " | left rail locked out" or "")
 end)
 swerve:Label(function()
     local actual = currentRoot and currentRoot.AssemblyLinearVelocity.Magnitude
@@ -1232,6 +1445,16 @@ swerve:Label(function()
 end)
 swerve:Label(function()
     return "Retries recovered: " .. tostring(State.retryCount)
+        .. " | " .. (State.retryArmed
+            and ("ARMED: " .. tostring(State.retryReason))
+            or "watching score + Fail")
+end)
+swerve:Label(function()
+    local remaining = math.max(0, State.autoPayoutScore - readSwerveScore())
+    return State.payoutInProgress
+        and "2M payout: cashing out and restarting"
+        or ("2M payout cycles: " .. tostring(State.payoutCycles)
+            .. " | remaining: " .. tostring(remaining))
 end)
 swerve:Label(function()
     local hesi = getSwerveGui()
@@ -1302,14 +1525,11 @@ task.spawn(function()
 end)
 
 task.spawn(function()
-    local lastAttempt = 0
     while _G.__CorsaBoostToken == token do
-        if State.autoRetry and tick() - lastAttempt >= 1.25 then
-            if clickSwerveRetry() then
-                lastAttempt = tick()
-            end
-        end
-        task.wait(0.20)
+        if State.autoPayout then cycleSwervePayout(false) end
+        updateRetryArm()
+        if State.autoRetry then clickSwerveRetry(false) end
+        task.wait(0.08)
     end
 end)
 
@@ -1416,32 +1636,67 @@ task.spawn(function()
                             swerveLanes[3] - swerveLanes[2]
                         )
                         local safeMargin = math.max(2, laneGap * 0.22)
-                        local safeLeft = swerveLanes[1] - safeMargin
+                        local safeLeft = State.avoidLeftRail
+                            and (swerveLanes[1] - 1.5)
+                            or (swerveLanes[1] - safeMargin)
                         local safeRight = swerveLanes[3] + safeMargin
 
+                        local microOffset = updateMicroSwerve()
+                        local lightTapActive = microOffset ~= 0
+                            or swerveMicroNeedsRecovery
+                        local lateralAcceleration = lightTapActive
+                            and State.microSwerveAcceleration
+                            or math.min(
+                                State.swerveLaneAcceleration,
+                                SWERVE_MAX_LATERAL_ACCELERATION
+                            )
+                        local lateralSpeedLimit = lightTapActive
+                            and math.min(State.microSwerveLateralSpeed, 4)
+                            or math.min(
+                                State.swerveLaneSpeed,
+                                SWERVE_MAX_LATERAL_SPEED
+                            )
+                        local laneCenterX = swerveLanes[swerveLane]
                         local targetX = clamp(
-                            swerveLanes[swerveLane] + updateMicroSwerve(),
+                            laneCenterX + microOffset,
                             safeLeft,
                             safeRight
                         )
                         local lateralError = targetX - position.X
                         local stoppingSpeed = math.sqrt(math.max(
                             0,
-                            2 * State.swerveLaneAcceleration * math.abs(lateralError)
+                            2 * lateralAcceleration * math.abs(lateralError)
                         ))
-                        local desiredX = math.min(State.swerveLaneSpeed, stoppingSpeed)
+                        local desiredX = math.min(lateralSpeedLimit, stoppingSpeed)
                         if lateralError < 0 then desiredX = -desiredX end
-                        if math.abs(lateralError) < 0.25 then desiredX = 0 end
+                        if math.abs(lateralError) < 0.15 then desiredX = 0 end
 
                         local lateralStep = math.min(
-                            State.swerveLaneAcceleration * dt,
-                            5
+                            lateralAcceleration * dt,
+                            lightTapActive and 1.5 or 5
                         )
                         local newX = output.X + clamp(
                             desiredX - output.X,
                             -lateralStep,
                             lateralStep
                         )
+                        newX = clamp(newX, -lateralSpeedLimit, lateralSpeedLimit)
+
+                        -- Never let a leftward velocity carry the car into the
+                        -- trash-lined guard rail. From lane 1, always recover right.
+                        if State.avoidLeftRail then
+                            if position.X <= swerveLanes[1] - 1.5 then
+                                newX = math.max(newX, 5)
+                            elseif position.X <= swerveLanes[1] + 2 then
+                                newX = math.max(newX, 2.5)
+                            end
+                        end
+
+                        if microOffset == 0
+                            and math.abs(position.X - laneCenterX) < 0.25
+                            and math.abs(newX) < 0.50 then
+                            swerveMicroNeedsRecovery = false
+                        end
                         local newZ = output.Z + clamp(
                             State.swerveSpeed - output.Z,
                             -State.swerveAcceleration * dt,
