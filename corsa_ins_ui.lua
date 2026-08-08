@@ -120,6 +120,10 @@ local State = {
     crashGuardActive = false,
     crashGuardDistance = 120,
     crashGuardSpeed = 0,
+    serverGhostProtection = true,
+    serverGhostCutoff = 100,
+    serverGhostsRemoved = 0,
+    serverGhostResets = 0,
     autoRetry = true,
     retryCount = 0,
 
@@ -132,6 +136,8 @@ _G.__CorsaState = State
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local player = Players.LocalPlayer
+local remotesFolder = ReplicatedStorage:FindFirstChild("Remotes")
+local swerveRemotes = remotesFolder and remotesFolder:FindFirstChild("SwerveRemotes")
 local token = oldToken
 local currentCar
 local currentSeat
@@ -152,15 +158,16 @@ local collisionModelAddresses = {}
 local playerWheelParts = {}
 local detachedTrafficProxies = {}
 local detachedTrafficProxyAddresses = {}
+local removedServerGhostIds = {}
 local lastCharacterSpeed
 local lastCrashGuardWrite = 0
 
 local win = Lib:CreateWindow({
     title = "Corsa Controller",
-    subtitle = "stable chassis + Swerve v15",
+    subtitle = "stable chassis + Swerve v16",
     size = Vector2.new(720, 540),
     menuKey = "p",
-    configName = "corsa-controller-v15",
+    configName = "corsa-controller-v16",
     configFolder = "corsa-controller",
     accentA = Color3.fromRGB(84, 168, 255),
     accentB = Color3.fromRGB(105, 255, 202),
@@ -368,6 +375,29 @@ local function resolveSwerveCourse()
     return false
 end
 
+local function getSwerveRemote(name)
+    if not swerveRemotes or not swerveRemotes.Parent then
+        remotesFolder = ReplicatedStorage:FindFirstChild("Remotes")
+        swerveRemotes = remotesFolder and remotesFolder:FindFirstChild("SwerveRemotes")
+    end
+    return swerveRemotes and swerveRemotes:FindFirstChild(name)
+end
+
+local function resetServerGhosts()
+    if not State.serverGhostProtection then return false end
+    local ghostReset = getSwerveRemote("GhostReset")
+    if not ghostReset then return false end
+
+    local ok = pcall(function()
+        ghostReset:FireServer()
+    end)
+    if ok then
+        removedServerGhostIds = {}
+        State.serverGhostResets = State.serverGhostResets + 1
+    end
+    return ok
+end
+
 
 local function enterSwerveCourse(notifyUser)
     local car = getCar()
@@ -399,10 +429,10 @@ local function enterSwerveCourse(notifyUser)
     swerveLane = nearestSwerveLane(root.Position.X)
     swerveNextWeave = tick() + State.swerveWeaveDelay
     swerveFaulted = false
+    State.serverGhostsRemoved = 0
+    resetServerGhosts()
 
-    local remotes = game:GetService("ReplicatedStorage"):FindFirstChild("Remotes")
-    local swerveRemotes = remotes and remotes:FindFirstChild("SwerveRemotes")
-    local scoreStart = swerveRemotes and swerveRemotes:FindFirstChild("ScoreStart")
+    local scoreStart = getSwerveRemote("ScoreStart")
     if scoreStart then
         pcall(function() scoreStart:FireServer() end)
     end
@@ -626,6 +656,41 @@ local function trafficIsClose(root)
     end
 
     return false
+end
+
+local function removeImminentServerGhosts()
+    local root = currentRoot
+    if not (State.serverGhostProtection and State.swerveEnabled and root) then
+        return
+    end
+
+    local ghostDespawn = getSwerveRemote("GhostDespawn")
+    if not ghostDespawn then return end
+
+    local position = root.Position
+    for i = 1, #collisionModels do
+        local car = collisionModels[i]
+        local part = car and car.PrimaryPart
+        if part then
+            local ahead = part.Position.Z - position.Z
+            local lateral = math.abs(part.Position.X - position.X)
+            if ahead > -25
+                and ahead <= State.serverGhostCutoff
+                and lateral < 14 then
+                local ghostId = car:GetAttribute("GhostId")
+                local key = ghostId and tostring(ghostId)
+                if key and not removedServerGhostIds[key] then
+                    local ok = pcall(function()
+                        ghostDespawn:FireServer(key)
+                    end)
+                    if ok then
+                        removedServerGhostIds[key] = tick()
+                        State.serverGhostsRemoved = State.serverGhostsRemoved + 1
+                    end
+                end
+            end
+        end
+    end
 end
 
 local function enforceCrashGuard()
@@ -994,6 +1059,13 @@ swerve:Toggle("Crash detector guard", true, function(on)
     State.crashGuard = on
     if not on then State.crashGuardActive = false end
 end)
+swerve:Toggle("Server crash-hitbox guard", true, function(on)
+    State.serverGhostProtection = on
+    if on and State.swerveEnabled then resetServerGhosts() end
+end)
+swerve:Slider("Server ghost cutoff", 100, 5, 60, 160, " studs", function(v)
+    State.serverGhostCutoff = v
+end)
 swerve:Button("Click Retry now", function()
     if not clickSwerveRetry() then
         Lib:Notify("Swerve", "Retry screen is not active", 2, "warning")
@@ -1007,6 +1079,15 @@ swerve:Button("Reapply traffic ghosting", function()
             .. " parts held non-collidable; " .. tostring(remaining) .. " remaining",
         4,
         remaining == 0 and "success" or "warning"
+    )
+end)
+swerve:Button("Reset server traffic ghosts", function()
+    local ok = resetServerGhosts()
+    Lib:Notify(
+        "Swerve",
+        ok and "Server traffic ghosts cleared" or "GhostReset remote was unavailable",
+        3,
+        ok and "success" or "warning"
     )
 end)
 swerve:Label(function()
@@ -1032,6 +1113,11 @@ swerve:Label(function()
     return State.crashGuardActive
         and ("Crash detector guard: ACTIVE at " .. tostring(speed))
         or ("Crash detector guard: armed | reference " .. tostring(speed))
+end)
+swerve:Label(function()
+    return "Server crash ghosts removed: " .. tostring(State.serverGhostsRemoved)
+        .. " | resets: " .. tostring(State.serverGhostResets)
+        .. " | cutoff: " .. tostring(State.serverGhostCutoff)
 end)
 swerve:Label(function()
     local ahead = State.trafficAhead
@@ -1136,6 +1222,7 @@ collisionStepped = runService.Stepped:Connect(function()
     end
 
     enforceTrafficGhosting()
+    removeImminentServerGhosts()
     enforceCrashGuard()
 end)
 
