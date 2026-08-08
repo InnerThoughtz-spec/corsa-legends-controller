@@ -103,6 +103,11 @@ local State = {
     swerveWeaveDelay = 6,
     swerveKeepStraight = true,
     trafficNoCollision = true,
+    trafficDetected = 0,
+    trafficAhead = math.huge,
+    trafficGhosted = 0,
+    autoRetry = true,
+    retryCount = 0,
 
     antiAfk = true,
     antiAfkInterval = 55,
@@ -127,14 +132,13 @@ local swerveFaulted = false
 local ghostedTrafficParts = {}
 local collisionParts = {}
 local collisionPartAddresses = {}
-local collisionGcCache
 
 local win = Lib:CreateWindow({
     title = "Corsa Controller",
-    subtitle = "stable chassis + Swerve v10",
+    subtitle = "stable chassis + Swerve v11",
     size = Vector2.new(720, 540),
     menuKey = "p",
-    configName = "corsa-controller-v10",
+    configName = "corsa-controller-v11",
     configFolder = "corsa-controller",
     accentA = Color3.fromRGB(84, 168, 255),
     accentB = Color3.fromRGB(105, 255, 202),
@@ -408,16 +412,13 @@ local function updateSwerveLane()
     local root = currentRoot
     if not (State.swerveEnabled and root) then return end
 
-    if State.swerveKeepStraight then
-        return
-    end
-
     local traffic = game.Workspace:FindFirstChild("AITraffic")
     local cars = traffic and traffic:FindFirstChild("Car")
     if not cars then return end
 
     local position = root.Position
     local clearance = { math.huge, math.huge, math.huge }
+    local detected = 0
 
     for _, car in ipairs(cars:GetChildren()) do
         local part = car.PrimaryPart or car:FindFirstChildWhichIsA("BasePart", true)
@@ -425,14 +426,25 @@ local function updateSwerveLane()
             local ahead = part.Position.Z - position.Z
             if ahead > -12 then
                 local lane = nearestSwerveLane(part.Position.X)
-                clearance[lane] = math.min(clearance[lane], math.max(0, ahead))
+                local lateralDistance = math.abs(part.Position.X - swerveLanes[lane])
+                if lateralDistance <= 8 then
+                    detected = detected + 1
+                    clearance[lane] = math.min(clearance[lane], math.max(0, ahead))
+                end
             end
         end
     end
 
     local now = tick()
     local blocked = clearance[swerveLane] < State.swerveAvoidDistance
-    if now < swerveNextWeave then return end
+    State.trafficDetected = detected
+    State.trafficAhead = clearance[swerveLane]
+    if not blocked and now < swerveNextWeave then return end
+
+    if not blocked and State.swerveKeepStraight then
+        swerveNextWeave = now + 0.25
+        return
+    end
 
     local bestLane = swerveLane
     local bestScore = -math.huge
@@ -457,7 +469,7 @@ local function updateSwerveLane()
     end
 
     swerveLane = bestLane
-    swerveNextWeave = now + (blocked and 0.9 or State.swerveWeaveDelay)
+    swerveNextWeave = now + (blocked and 0.25 or State.swerveWeaveDelay)
 end
 
 local function disableTrafficCollisions()
@@ -474,7 +486,7 @@ local function disableTrafficCollisions()
                 or part.ClassName == "MeshPart"
                 or part.ClassName == "UnionOperation" then
                 local address = part.Address
-                if part.Name == "Collide" and not collisionPartAddresses[address] then
+                if not collisionPartAddresses[address] then
                     collisionPartAddresses[address] = true
                     collisionParts[#collisionParts + 1] = part
                 end
@@ -485,10 +497,59 @@ local function disableTrafficCollisions()
                 end
             end
         end
+        pcall(function() car:SetAttribute("CollisionEnforced", false) end)
     end
 
+    State.trafficGhosted = #collisionParts
     return changed
 end
+
+local function getSwerveGui()
+    local gui = player:FindFirstChild("PlayerGui")
+    local purchase = gui and gui:FindFirstChild("PurchaseGUI")
+    return purchase and purchase:FindFirstChild("HesiUI")
+end
+
+local function clickSwerveRetry()
+    if not State.autoRetry then return false end
+
+    local hesi = getSwerveGui()
+    local failed = hesi and hesi:FindFirstChild("Fail")
+    local retry = hesi and hesi:FindFirstChild("Retry")
+    if not (failed and failed.Value == true and retry) then return false end
+
+    local position = retry.AbsolutePosition
+    local size = retry.AbsoluteSize
+    if not position or not size or size.X < 2 or size.Y < 2 then return false end
+
+    local mouse = player:GetMouse()
+    local oldX = mouse and mouse.X
+    local oldY = mouse and mouse.Y
+    local clicked = false
+    local clickOk = pcall(function()
+        mousemoveabs(position.X + size.X * 0.5, position.Y + size.Y * 0.5)
+        mouse1click()
+        clicked = true
+        if oldX and oldY then mousemoveabs(oldX, oldY) end
+    end)
+    if not clickOk or not clicked then return false end
+
+    State.retryCount = State.retryCount + 1
+    State.enabled = true
+    State.swerveEnabled = true
+    swerveFaulted = false
+
+    task.delay(0.30, function()
+        if _G.__CorsaBoostToken == token then
+            enterSwerveCourse(false)
+        end
+    end)
+
+    Lib:Notify("Swerve", "Retry clicked; autofarm resumed", 2, "success")
+    return true
+end
+
+_G.__CorsaRetrySwerve = clickSwerveRetry
 
 local function captureCar(car)
     currentCar = car
@@ -708,7 +769,7 @@ end)
 swerve:Slider("Weave delay", 6, 0.5, 2, 12, "s", function(v)
     State.swerveWeaveDelay = v
 end)
-swerve:Toggle("Keep car straight", true, function(on)
+swerve:Toggle("Stay in lane until blocked", true, function(on)
     State.swerveKeepStraight = on
     if on and currentRoot then
         swerveLane = nearestSwerveLane(currentRoot.Position.X)
@@ -722,6 +783,14 @@ swerve:Button("Stop autofarm", function()
 end)
 swerve:Button("Stabilize current lane", function()
     stabilizeSwerveCar(currentRoot)
+end)
+swerve:Toggle("Auto-click Retry", true, function(on)
+    State.autoRetry = on
+end)
+swerve:Button("Click Retry now", function()
+    if not clickSwerveRetry() then
+        Lib:Notify("Swerve", "Retry screen is not active", 2, "warning")
+    end
 end)
 swerve:Button("Reapply traffic ghosting", function()
     local changed = disableTrafficCollisions()
@@ -738,9 +807,17 @@ swerve:Label(function()
 end)
 swerve:Label("AI traffic collision: disabled")
 swerve:Label(function()
-    local gui = player:FindFirstChild("PlayerGui")
-    local purchase = gui and gui:FindFirstChild("PurchaseGUI")
-    local hesi = purchase and purchase:FindFirstChild("HesiUI")
+    local ahead = State.trafficAhead
+    local nearest = ahead == math.huge and "clear" or (tostring(math.floor(ahead + 0.5)) .. " studs")
+    return "Traffic: " .. tostring(State.trafficDetected)
+        .. " tracked | target lane " .. nearest
+        .. " | " .. tostring(State.trafficGhosted) .. " parts ghosted"
+end)
+swerve:Label(function()
+    return "Retries recovered: " .. tostring(State.retryCount)
+end)
+swerve:Label(function()
+    local hesi = getSwerveGui()
     local score = hesi and hesi:FindFirstChild("Score")
     return "Swerve score: " .. (score and tostring(score.Text) or "0")
 end)
@@ -795,12 +872,20 @@ end)
 task.spawn(function()
     while _G.__CorsaBoostToken == token do
         disableTrafficCollisions()
-        task.wait(0.40)
+        task.wait(0.15)
     end
 end)
 
 task.spawn(function()
-    collisionGcCache = getgc("collisionsEnabledBySpeed")
+    local lastAttempt = 0
+    while _G.__CorsaBoostToken == token do
+        if State.autoRetry and tick() - lastAttempt >= 1.25 then
+            if clickSwerveRetry() then
+                lastAttempt = tick()
+            end
+        end
+        task.wait(0.20)
+    end
 end)
 
 local collisionHeartbeat
@@ -811,12 +896,6 @@ collisionHeartbeat = game:GetService("RunService").Heartbeat:Connect(function()
     end
 
     if not State.trafficNoCollision then return end
-
-    if collisionGcCache then
-        pcall(function()
-            applygc(collisionGcCache, "collisionsEnabledBySpeed", true)
-        end)
-    end
 
     for i = 1, #collisionParts do
         local part = collisionParts[i]
