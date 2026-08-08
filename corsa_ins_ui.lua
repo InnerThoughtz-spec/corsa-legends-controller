@@ -60,6 +60,8 @@ uiSource = patchedSource
 
 local uiLoader = assert(loadstring(uiSource))
 local Lib = uiLoader() or INSui
+local MPH_PER_STUD_PER_SECOND = 0.626342
+local SWERVE_MAX_MPH = 370
 
 local State = {
     enabled = true,
@@ -102,13 +104,17 @@ local State = {
 
     swerveEnabled = false,
     swerveAutoEnter = true,
-    swerveSpeed = 220,
-    swerveAcceleration = 90,
-    swerveAvoidDistance = 300,
+    swerveTargetMPH = SWERVE_MAX_MPH,
+    swerveSpeed = SWERVE_MAX_MPH / MPH_PER_STUD_PER_SECOND,
+    swerveAcceleration = 150,
     swerveLaneSpeed = 14,
     swerveLaneAcceleration = 72,
-    swerveWeaveDelay = 1.0,
-    swerveKeepStraight = true,
+    microSwerveEnabled = true,
+    microSwerveWidth = 3.5,
+    microSwerveHold = 0.30,
+    microSwervePause = 0.80,
+    microSwervePhase = "center",
+    microSwerveCount = 0,
     trafficNoCollision = true,
     trafficDetected = 0,
     trafficAhead = math.huge,
@@ -145,7 +151,10 @@ local currentRoot
 local currentAddress
 local swerveCarAddress
 local swerveLane = 2
-local swerveNextWeave = 0
+local swerveMicroOffset = 0
+local swerveMicroDirection = 1
+local swerveMicroReturnAt = 0
+local swerveMicroNextAt = 0
 local swerveLanes = { 4805.187, 4821.565, 4837.794 }
 local swerveStartZ = 19215
 local swerveForward = Vector3.new(0, 0, 1)
@@ -164,10 +173,10 @@ local lastCrashGuardWrite = 0
 
 local win = Lib:CreateWindow({
     title = "Corsa Controller",
-    subtitle = "stable chassis + Swerve v16",
+    subtitle = "stable chassis + Swerve v17",
     size = Vector2.new(720, 540),
     menuKey = "p",
-    configName = "corsa-controller-v16",
+    configName = "corsa-controller-v17",
     configFolder = "corsa-controller",
     accentA = Color3.fromRGB(84, 168, 255),
     accentB = Color3.fromRGB(105, 255, 202),
@@ -427,7 +436,12 @@ local function enterSwerveCourse(notifyUser)
     resolveSwerveCourse()
     -- Lock the lane the player started in. Traffic never changes this target.
     swerveLane = nearestSwerveLane(root.Position.X)
-    swerveNextWeave = tick() + State.swerveWeaveDelay
+    swerveMicroOffset = 0
+    swerveMicroDirection = 1
+    swerveMicroReturnAt = 0
+    swerveMicroNextAt = tick() + 0.60
+    State.microSwervePhase = "center"
+    State.microSwerveCount = 0
     swerveFaulted = false
     State.serverGhostsRemoved = 0
     resetServerGhosts()
@@ -465,8 +479,69 @@ end
 
 _G.__CorsaStopSwerve = function()
     State.swerveEnabled = false
+    swerveMicroOffset = 0
+    State.microSwervePhase = "center"
     if _G.__CorsaRestoreWheels then pcall(_G.__CorsaRestoreWheels) end
     Lib:Notify("Swerve", "autofarm stopped", 2, "warning")
+end
+
+local function chooseMicroSwerveDirection()
+    local root = currentRoot
+    if root then
+        local position = root.Position
+        local bestAhead = math.huge
+        local bestDirection
+
+        for i = 1, #collisionModels do
+            local car = collisionModels[i]
+            local part = car and car.PrimaryPart
+            if part then
+                local ahead = part.Position.Z - position.Z
+                if ahead > State.serverGhostCutoff + 15 and ahead < 280
+                    and ahead < bestAhead then
+                    local difference = part.Position.X - position.X
+                    if math.abs(difference) > 5 then
+                        bestAhead = ahead
+                        bestDirection = difference > 0 and 1 or -1
+                    end
+                end
+            end
+        end
+
+        if bestDirection then
+            swerveMicroDirection = bestDirection
+            return bestDirection
+        end
+    end
+
+    swerveMicroDirection = -swerveMicroDirection
+    return swerveMicroDirection
+end
+
+local function updateMicroSwerve()
+    local now = tick()
+    if not (State.swerveEnabled and State.microSwerveEnabled) then
+        swerveMicroOffset = 0
+        State.microSwervePhase = "center"
+        swerveMicroNextAt = now + State.microSwervePause
+        return 0
+    end
+
+    if swerveMicroOffset ~= 0 then
+        if now >= swerveMicroReturnAt then
+            swerveMicroOffset = 0
+            State.microSwervePhase = "center"
+            swerveMicroNextAt = now + State.microSwervePause
+        end
+    elseif now >= swerveMicroNextAt then
+        local direction = chooseMicroSwerveDirection()
+        swerveMicroOffset = direction * State.microSwerveWidth
+        swerveMicroReturnAt = now + State.microSwerveHold
+        State.microSwervePhase = direction < 0 and "A tap" or "D tap"
+        State.microSwerveCount = State.microSwerveCount + 1
+    end
+
+    return swerveMicroOffset
 end
 
 local function updateSwerveLane()
@@ -883,7 +958,8 @@ live:Label(function()
 end)
 live:Label(function()
     local velocity = currentRoot and currentRoot.AssemblyLinearVelocity
-    return "Speed: " .. tostring(velocity and math.floor(velocity.Magnitude) or 0)
+    local mph = velocity and velocity.Magnitude * MPH_PER_STUD_PER_SECOND or 0
+    return "Speed: " .. tostring(math.floor(mph + 0.5)) .. " MPH"
 end)
 live:Label(function()
     return "Nitro: " .. (State.nitroHeld and "active" or "ready")
@@ -1030,10 +1106,12 @@ end)
 swerve:Toggle("Initialize on car spawn", true, function(on)
     State.swerveAutoEnter = on
 end)
-swerve:Slider("Farm speed", 220, 10, 100, 400, "", function(v)
-    State.swerveSpeed = v
+swerve:Slider("Farm target speed", 370, 10, 150, 370, " MPH", function(v)
+    local target = math.min(v, SWERVE_MAX_MPH)
+    State.swerveTargetMPH = target
+    State.swerveSpeed = target / MPH_PER_STUD_PER_SECOND
 end)
-swerve:Slider("Acceleration", 90, 5, 30, 180, "", function(v)
+swerve:Slider("Acceleration", 150, 5, 30, 240, "", function(v)
     State.swerveAcceleration = v
 end)
 swerve:Slider("Lane centering speed", 14, 1, 8, 24, "", function(v)
@@ -1042,7 +1120,23 @@ end)
 swerve:Slider("Lane centering brake", 72, 2, 30, 100, "", function(v)
     State.swerveLaneAcceleration = v
 end)
-swerve:Info("Fixed-lane mode: traffic never changes the selected lane. Hidden AI hitboxes are removed while all four player wheels stay solid on the road.")
+swerve:Toggle("Micro-swerve taps", true, function(on)
+    State.microSwerveEnabled = on
+    if not on then
+        swerveMicroOffset = 0
+        State.microSwervePhase = "center"
+    end
+end)
+swerve:Slider("Tap width", 3.5, 0.25, 1, 6, " studs", function(v)
+    State.microSwerveWidth = v
+end)
+swerve:Slider("Tap hold", 0.30, 0.05, 0.15, 0.60, "s", function(v)
+    State.microSwerveHold = v
+end)
+swerve:Slider("Time between taps", 0.80, 0.05, 0.35, 2.0, "s", function(v)
+    State.microSwervePause = v
+end)
+swerve:Info("Micro-swerve mode keeps the selected lane, then makes short A/D-style nudges toward nearby traffic before returning to center.")
 swerve:Button("Initialize from current position", function()
     _G.__CorsaStartSwerve()
 end)
@@ -1092,6 +1186,16 @@ swerve:Button("Reset server traffic ghosts", function()
 end)
 swerve:Label(function()
     return "Target lane: " .. tostring(swerveLane)
+end)
+swerve:Label(function()
+    local actual = currentRoot and currentRoot.AssemblyLinearVelocity.Magnitude
+        * MPH_PER_STUD_PER_SECOND or 0
+    return "Farm speed: " .. tostring(math.floor(actual + 0.5))
+        .. " / " .. tostring(State.swerveTargetMPH) .. " MPH"
+end)
+swerve:Label(function()
+    return "Micro-swerve: " .. tostring(State.microSwervePhase)
+        .. " | taps: " .. tostring(State.microSwerveCount)
 end)
 swerve:Label(function()
     if not State.swerveEnabled then return "Farm: stopped" end
@@ -1316,7 +1420,7 @@ task.spawn(function()
                         local safeRight = swerveLanes[3] + safeMargin
 
                         local targetX = clamp(
-                            swerveLanes[swerveLane],
+                            swerveLanes[swerveLane] + updateMicroSwerve(),
                             safeLeft,
                             safeRight
                         )
