@@ -86,6 +86,9 @@ local swerveStartZ = 19215
 local swerveForward = Vector3.new(0, 0, 1)
 local swerveFaulted = false
 local ghostedTrafficParts = {}
+local collisionParts = {}
+local collisionPartAddresses = {}
+local collisionGcCache
 
 local win = Lib:CreateWindow({
     title = "Corsa Controller",
@@ -423,6 +426,10 @@ local function disableTrafficCollisions()
                 or part.ClassName == "MeshPart"
                 or part.ClassName == "UnionOperation" then
                 local address = part.Address
+                if part.Name == "Collide" and not collisionPartAddresses[address] then
+                    collisionPartAddresses[address] = true
+                    collisionParts[#collisionParts + 1] = part
+                end
                 if not ghostedTrafficParts[address] or part.CanCollide then
                     pcall(function() part.CanCollide = false end)
                     ghostedTrafficParts[address] = true
@@ -741,6 +748,33 @@ task.spawn(function()
     while _G.__CorsaBoostToken == token do
         disableTrafficCollisions()
         task.wait(0.40)
+    end
+end)
+
+task.spawn(function()
+    collisionGcCache = getgc("collisionsEnabledBySpeed")
+end)
+
+local collisionHeartbeat
+collisionHeartbeat = game:GetService("RunService").Heartbeat:Connect(function()
+    if _G.__CorsaBoostToken ~= token then
+        collisionHeartbeat:Disconnect()
+        return
+    end
+
+    if not State.trafficNoCollision then return end
+
+    if collisionGcCache then
+        pcall(function()
+            applygc(collisionGcCache, "collisionsEnabledBySpeed", true)
+        end)
+    end
+
+    for i = 1, #collisionParts do
+        local part = collisionParts[i]
+        if part and part.CanCollide then
+            pcall(function() part.CanCollide = false end)
+        end
     end
 end)
 
