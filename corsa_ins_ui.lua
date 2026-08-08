@@ -10,6 +10,9 @@ _G.__CorsaHack = false
 if _G.__CorsaRestoreWheels then
     pcall(_G.__CorsaRestoreWheels)
 end
+if _G.__CorsaRestoreTrafficProxies then
+    pcall(_G.__CorsaRestoreTrafficProxies)
+end
 
 if _G.__CorsaUI then
     pcall(function() _G.__CorsaUI:Destroy() end)
@@ -112,7 +115,7 @@ local State = {
     trafficGhosted = 0,
     trafficModels = 0,
     trafficCollidable = 0,
-    trafficPhaseActive = false,
+    trafficProxiesDetached = 0,
     autoRetry = true,
     retryCount = 0,
 
@@ -123,6 +126,7 @@ local State = {
 _G.__CorsaState = State
 
 local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local player = Players.LocalPlayer
 local token = oldToken
 local currentCar
@@ -142,13 +146,15 @@ local collisionPartAddresses = {}
 local collisionModels = {}
 local collisionModelAddresses = {}
 local playerWheelParts = {}
+local detachedTrafficProxies = {}
+local detachedTrafficProxyAddresses = {}
 
 local win = Lib:CreateWindow({
     title = "Corsa Controller",
-    subtitle = "stable chassis + Swerve v13",
+    subtitle = "stable chassis + Swerve v14",
     size = Vector2.new(720, 540),
     menuKey = "p",
-    configName = "corsa-controller-v13",
+    configName = "corsa-controller-v14",
     configFolder = "corsa-controller",
     accentA = Color3.fromRGB(84, 168, 255),
     accentB = Color3.fromRGB(105, 255, 202),
@@ -495,16 +501,31 @@ local function cacheTrafficModel(car)
     for _, part in ipairs(car:GetDescendants()) do
         if isTrafficPart(part) then
             local partAddress = part.Address
-            if partAddress and not collisionPartAddresses[partAddress] then
+            if part.Name == "Collide" then
+                if partAddress and not detachedTrafficProxyAddresses[partAddress] then
+                    detachedTrafficProxyAddresses[partAddress] = true
+                    detachedTrafficProxies[#detachedTrafficProxies + 1] = {
+                        part = part,
+                        parent = car,
+                    }
+                end
+                pcall(function()
+                    part.CanCollide = false
+                    part.Parent = ReplicatedStorage
+                end)
+            elseif partAddress and not collisionPartAddresses[partAddress] then
                 collisionPartAddresses[partAddress] = true
                 collisionParts[#collisionParts + 1] = part
                 ghostedTrafficParts[partAddress] = true
                 added = added + 1
+                pcall(function() part.CanCollide = false end)
+            else
+                pcall(function() part.CanCollide = false end)
             end
-            pcall(function() part.CanCollide = false end)
         end
     end
 
+    State.trafficProxiesDetached = #detachedTrafficProxies
     return added
 end
 
@@ -518,48 +539,39 @@ local function discoverTrafficModels()
     end
 end
 
-local function setPlayerTrafficPhase(active)
-    State.trafficPhaseActive = active == true
+local function restorePlayerWheels()
     for i = 1, #playerWheelParts do
         local wheel = playerWheelParts[i]
         if wheel then
-            pcall(function() wheel.CanCollide = not State.trafficPhaseActive end)
+            pcall(function() wheel.CanCollide = true end)
         end
     end
 end
 
 _G.__CorsaRestoreWheels = function()
-    setPlayerTrafficPhase(false)
+    restorePlayerWheels()
 end
 
-local function trafficOverlapImminent()
-    local root = currentRoot
-    if not (State.swerveEnabled and root) then return false end
-    if root.AssemblyLinearVelocity.Magnitude < 30 then return false end
-
-    local position = root.Position
-    for i = 1, #collisionModels do
-        local car = collisionModels[i]
-        if car then
-            local part = car.PrimaryPart or car:FindFirstChildWhichIsA("BasePart", true)
-            if part then
-                local ahead = part.Position.Z - position.Z
-                local lateral = math.abs(part.Position.X - position.X)
-                if ahead > -28 and ahead < 110 and lateral < 12 then
-                    return true
-                end
-            end
+local function restoreTrafficProxies()
+    for i = 1, #detachedTrafficProxies do
+        local entry = detachedTrafficProxies[i]
+        if entry and entry.part and entry.parent then
+            pcall(function()
+                entry.part.Parent = entry.parent
+                entry.part.CanCollide = true
+            end)
         end
     end
 
-    return false
+    detachedTrafficProxies = {}
+    detachedTrafficProxyAddresses = {}
+    State.trafficProxiesDetached = 0
 end
 
+_G.__CorsaRestoreTrafficProxies = restoreTrafficProxies
+
 local function enforceTrafficGhosting()
-    if not State.trafficNoCollision then
-        setPlayerTrafficPhase(false)
-        return
-    end
+    if not State.trafficNoCollision then return end
 
     -- Discovery runs before physics. An AI car can no longer remain solid for
     -- the old 0.15 second polling window after it spawns.
@@ -581,10 +593,7 @@ local function enforceTrafficGhosting()
         end
     end
 
-    -- AI vehicles are server-driven. Phasing the player's wheel colliders for
-    -- only the overlap window removes the local side of the collision pair too.
-    -- Velocity control keeps the car level for this short pass-through window.
-    setPlayerTrafficPhase(trafficOverlapImminent())
+    restorePlayerWheels()
 end
 
 local function rebuildTrafficCache()
@@ -666,7 +675,7 @@ end
 _G.__CorsaRetrySwerve = clickSwerveRetry
 
 local function captureCar(car)
-    setPlayerTrafficPhase(false)
+    restorePlayerWheels()
     playerWheelParts = {}
     currentCar = car
     currentAddress = car and car.Address
@@ -887,7 +896,7 @@ end)
 swerve:Slider("Lane centering brake", 72, 2, 30, 100, "", function(v)
     State.swerveLaneAcceleration = v
 end)
-swerve:Info("Fixed-lane mode: traffic never changes the selected lane. AI cars and the player's wheels are phased only during overlap.")
+swerve:Info("Fixed-lane mode: traffic never changes the selected lane. Hidden AI hitboxes are removed while all four player wheels stay solid on the road.")
 swerve:Button("Initialize from current position", function()
     _G.__CorsaStartSwerve()
 end)
@@ -930,9 +939,8 @@ swerve:Label(function()
         .. tostring(State.trafficCollidable) .. " collidable remaining"
 end)
 swerve:Label(function()
-    return State.trafficPhaseActive
-        and "Player collision: phased through nearby AI"
-        or "Player collision: normal road grip"
+    return "AI hitboxes removed: " .. tostring(State.trafficProxiesDetached)
+        .. " | player wheels: always solid"
 end)
 swerve:Label(function()
     local ahead = State.trafficAhead
@@ -975,6 +983,9 @@ actions:Button("Stop controller", function()
     _G.__CorsaBoost = false
     _G.__CorsaBoostToken = _G.__CorsaBoostToken + 1
     if _G.__CorsaRestoreWheels then pcall(_G.__CorsaRestoreWheels) end
+    if _G.__CorsaRestoreTrafficProxies then
+        pcall(_G.__CorsaRestoreTrafficProxies)
+    end
     Lib:Notify("Corsa", "controller stopped", 2, "warning")
 end):SetRisk()
 
@@ -1027,7 +1038,8 @@ local collisionHeartbeat
 
 collisionStepped = runService.Stepped:Connect(function()
     if _G.__CorsaBoostToken ~= token then
-        setPlayerTrafficPhase(false)
+        restorePlayerWheels()
+        restoreTrafficProxies()
         collisionStepped:Disconnect()
         return
     end
@@ -1037,7 +1049,7 @@ end)
 
 collisionHeartbeat = runService.Heartbeat:Connect(function()
     if _G.__CorsaBoostToken ~= token then
-        setPlayerTrafficPhase(false)
+        restorePlayerWheels()
         collisionHeartbeat:Disconnect()
         return
     end
@@ -1151,8 +1163,7 @@ task.spawn(function()
                             -State.swerveAcceleration * dt,
                             State.swerveAcceleration * dt
                         )
-                        local newY = State.trafficPhaseActive
-                            and 0 or clamp(output.Y, -3, State.maxRise)
+                        local newY = clamp(output.Y, -3, State.maxRise)
                         output = Vector3.new(newX, newY, newZ)
 
                         -- The game fails Swerve when speed changes by 10 or more
