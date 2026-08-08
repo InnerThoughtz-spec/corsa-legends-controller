@@ -1,5 +1,6 @@
 -- Corsa Legends Controller using INS-ui
 -- Menu: P | Nitro: hold Left Shift
+-- Includes Swerve traffic farming, anti-AFK, and forced-induction tuning
 
 local oldToken = (_G.__CorsaBoostToken or 0) + 1
 _G.__CorsaBoostToken = oldToken
@@ -33,21 +34,65 @@ local State = {
     preload = 0.35,
     stiffness = 58,
     damping = 8600,
+
+    turbos = 2,
+    turboBoost = 24,
+    turboIdle = 12,
+    turboPeakRPM = 2800,
+    turboCurve = 0.63,
+    turboEfficiency = 5,
+    turboSpoolUp = 0.96,
+    turboSpoolDown = 0.96,
+
+    superchargers = 1,
+    superPeakBoost = 40.25,
+    superPeakRPM = 3000,
+    superIdleBoost = 10,
+    superIdleCurve = 0.50,
+    superRedlineBoost = 6,
+    superRedlineCurve = 0.50,
+    superEfficiency = 11.27,
+    superResponse = 0.60,
+
+    swerveEnabled = false,
+    swerveAutoEnter = true,
+    swerveSpeed = 220,
+    swerveAcceleration = 90,
+    swerveAvoidDistance = 300,
+    swerveLaneSpeed = 18,
+    swerveLaneAcceleration = 28,
+    swerveWeaveDelay = 6,
+    swerveKeepStraight = true,
+    trafficNoCollision = true,
+
+    antiAfk = true,
+    antiAfkInterval = 55,
 }
+
+_G.__CorsaState = State
 
 local Players = game:GetService("Players")
 local player = Players.LocalPlayer
 local token = oldToken
 local currentCar
 local currentSeat
+local currentRoot
 local currentAddress
+local swerveCarAddress
+local swerveLane = 2
+local swerveNextWeave = 0
+local swerveLanes = { 4805.187, 4821.565, 4837.794 }
+local swerveStartZ = 19215
+local swerveForward = Vector3.new(0, 0, 1)
+local swerveFaulted = false
+local ghostedTrafficParts = {}
 
 local win = Lib:CreateWindow({
     title = "Corsa Controller",
-    subtitle = "stable chassis v7",
+    subtitle = "stable chassis + Swerve v9",
     size = Vector2.new(720, 540),
     menuKey = "p",
-    configName = "corsa-controller",
+    configName = "corsa-controller-v9",
     configFolder = "corsa-controller",
     accentA = Color3.fromRGB(84, 168, 255),
     accentB = Color3.fromRGB(105, 255, 202),
@@ -88,8 +133,24 @@ local function buildTune()
         redline = "30000",
         shiftRPM = "28000",
         bhpLimit = "999999999",
-        TBoost = "80",
-        SPeakboost = "80",
+        Turbochargers = tostring(State.turbos),
+        TBoost = tostring(State.turboBoost),
+        TIdle = tostring(State.turboIdle),
+        TPeakRPM = tostring(State.turboPeakRPM),
+        TCurve = tostring(State.turboCurve),
+        TEff = tostring(State.turboEfficiency),
+        TSpoolInc = tostring(State.turboSpoolUp),
+        TSpoolDec = tostring(State.turboSpoolDown),
+
+        Superchargers = tostring(State.superchargers),
+        SPeakboost = tostring(State.superPeakBoost),
+        SPeakRPM = tostring(State.superPeakRPM),
+        SIdleBoost = tostring(State.superIdleBoost),
+        SIdleCurve = tostring(State.superIdleCurve),
+        SRedlineBoost = tostring(State.superRedlineBoost),
+        SRedlineCurve = tostring(State.superRedlineCurve),
+        SEfficiency = tostring(State.superEfficiency),
+        SResponseSResponse = tostring(State.superResponse),
         FinalDrive = "5",
 
         weight = tostring(State.weight),
@@ -172,15 +233,227 @@ local function findSeat(car)
     end
 end
 
+local function findVehicleRoot(car)
+    local body = car and car:FindFirstChild("Body")
+    local weight = body and body:FindFirstChild("#Weight")
+    return weight or (car and findSeat(car))
+end
+
+local function playerIsInCar(seat)
+    local character = player.Character
+    local characterRoot = character and character:FindFirstChild("HumanoidRootPart")
+    return characterRoot and seat
+        and (characterRoot.Position - seat.Position).Magnitude < 10
+end
+
+local function nearestSwerveLane(x)
+    local best = 1
+    local bestDistance = math.huge
+
+    for i = 1, #swerveLanes do
+        local distance = math.abs(x - swerveLanes[i])
+        if distance < bestDistance then
+            best = i
+            bestDistance = distance
+        end
+    end
+
+    return best
+end
+
+local function resolveSwerveCourse()
+    local traffic = game.Workspace:FindFirstChild("AITraffic")
+    local generated = traffic and traffic:FindFirstChild("GenRoad")
+    if not generated then return false end
+
+    for _, road in ipairs(generated:GetChildren()) do
+        if road.Name == "Road" then
+            local found = {}
+            local firstZ
+
+            for _, laneName in ipairs({ "Lane1", "Lane2", "Lane3" }) do
+                local lane = road:FindFirstChild(laneName)
+                if lane then
+                    found[#found + 1] = lane.Position.X
+                    firstZ = firstZ or lane.Position.Z
+                end
+            end
+
+            if #found == 3 then
+                table.sort(found)
+                swerveLanes = found
+                swerveStartZ = firstZ + 42
+                return true
+            end
+        end
+    end
+
+    return false
+end
+
+
+local function enterSwerveCourse(notifyUser)
+    local car = getCar()
+    local seat = car and findSeat(car)
+    local root = car and findVehicleRoot(car)
+    if not (seat and root) then
+        if notifyUser then
+            Lib:Notify("Swerve", "Spawn a car and sit in the driver seat first", 4, "warning")
+        end
+        return false
+    end
+
+    if not playerIsInCar(seat) then
+        if notifyUser then
+            Lib:Notify("Swerve", "Sit in the driver seat before starting", 4, "warning")
+        end
+        return false
+    end
+
+    resolveSwerveCourse()
+    swerveLane = nearestSwerveLane(root.Position.X)
+    swerveNextWeave = tick() + State.swerveWeaveDelay
+    swerveFaulted = false
+
+    local remotes = game:GetService("ReplicatedStorage"):FindFirstChild("Remotes")
+    local swerveRemotes = remotes and remotes:FindFirstChild("SwerveRemotes")
+    local scoreStart = swerveRemotes and swerveRemotes:FindFirstChild("ScoreStart")
+    if scoreStart then
+        pcall(function() scoreStart:FireServer() end)
+    end
+
+    swerveCarAddress = car.Address
+    if notifyUser then
+        Lib:Notify("Swerve", "Autofarm initialized at the car's current position", 3, "success")
+    end
+    return true
+end
+
+local function stabilizeSwerveCar(root)
+    if not root then return end
+    swerveLane = nearestSwerveLane(root.Position.X)
+    pcall(function()
+        local velocity = root.AssemblyLinearVelocity
+        root.AssemblyLinearVelocity = Vector3.new(
+            0,
+            clamp(velocity.Y, -4, State.maxRise),
+            math.max(velocity.Z, 45)
+        )
+    end)
+end
+
+_G.__CorsaStartSwerve = function()
+    State.enabled = true
+    State.swerveEnabled = true
+    return enterSwerveCourse(true)
+end
+
+_G.__CorsaStopSwerve = function()
+    State.swerveEnabled = false
+    Lib:Notify("Swerve", "autofarm stopped", 2, "warning")
+end
+
+local function updateSwerveLane()
+    local root = currentRoot
+    if not (State.swerveEnabled and root) then return end
+
+    if State.swerveKeepStraight then
+        return
+    end
+
+    local traffic = game.Workspace:FindFirstChild("AITraffic")
+    local cars = traffic and traffic:FindFirstChild("Car")
+    if not cars then return end
+
+    local position = root.Position
+    local clearance = { math.huge, math.huge, math.huge }
+
+    for _, car in ipairs(cars:GetChildren()) do
+        local part = car.PrimaryPart or car:FindFirstChildWhichIsA("BasePart", true)
+        if part then
+            local ahead = part.Position.Z - position.Z
+            if ahead > -12 then
+                local lane = nearestSwerveLane(part.Position.X)
+                clearance[lane] = math.min(clearance[lane], math.max(0, ahead))
+            end
+        end
+    end
+
+    local now = tick()
+    local blocked = clearance[swerveLane] < State.swerveAvoidDistance
+    if now < swerveNextWeave then return end
+
+    local bestLane = swerveLane
+    local bestScore = -math.huge
+
+    for lane = 1, 3 do
+        local laneClearance = math.min(clearance[lane], State.swerveAvoidDistance * 3)
+        local changePenalty = math.abs(lane - swerveLane) * 12
+        local repeatPenalty = lane == swerveLane and (blocked and 80 or 25) or 0
+        local score = laneClearance - changePenalty - repeatPenalty
+
+        if score > bestScore then
+            bestLane = lane
+            bestScore = score
+        end
+    end
+
+    if not blocked then
+        local weaveLane = swerveLane % 3 + 1
+        if clearance[weaveLane] > State.swerveAvoidDistance * 0.8 then
+            bestLane = weaveLane
+        end
+    end
+
+    swerveLane = bestLane
+    swerveNextWeave = now + (blocked and 0.9 or State.swerveWeaveDelay)
+end
+
+local function disableTrafficCollisions()
+    if not State.trafficNoCollision then return 0 end
+
+    local traffic = game.Workspace:FindFirstChild("AITraffic")
+    local cars = traffic and traffic:FindFirstChild("Car")
+    if not cars then return 0 end
+
+    local changed = 0
+    for _, car in ipairs(cars:GetChildren()) do
+        for _, part in ipairs(car:GetDescendants()) do
+            if part.ClassName == "Part"
+                or part.ClassName == "MeshPart"
+                or part.ClassName == "UnionOperation" then
+                local address = part.Address
+                if not ghostedTrafficParts[address] or part.CanCollide then
+                    pcall(function() part.CanCollide = false end)
+                    ghostedTrafficParts[address] = true
+                    changed = changed + 1
+                end
+            end
+        end
+    end
+
+    return changed
+end
+
 local function captureCar(car)
     currentCar = car
     currentAddress = car and car.Address
     currentSeat = nil
+    currentRoot = nil
 
     if car then
         applyTune(car, false)
         currentSeat = findSeat(car)
+        currentRoot = findVehicleRoot(car)
         Lib:Notify("Vehicle ready", car.Name, 2, "success")
+
+        if State.swerveEnabled and State.swerveAutoEnter then
+            task.delay(0.25, function()
+                if _G.__CorsaBoostToken == token then
+                    enterSwerveCourse(false)
+                end
+            end)
+        end
     end
 end
 
@@ -214,7 +487,7 @@ live:Label(function()
     return "Car: " .. (currentCar and currentCar.Name or "waiting")
 end)
 live:Label(function()
-    local velocity = currentSeat and currentSeat.AssemblyLinearVelocity
+    local velocity = currentRoot and currentRoot.AssemblyLinearVelocity
     return "Speed: " .. tostring(velocity and math.floor(velocity.Magnitude) or 0)
 end)
 live:Label(function()
@@ -281,6 +554,152 @@ suspension:Button("Apply chassis settings", function()
 end)
 suspension:Info("Respawn the vehicle after changing weight, ride length, preload, stiffness, or center of gravity.")
 
+local induction = win:Tab("Boost", "gauge")
+local turbo = induction:Section("Turbochargers", "Left", "count, boost curve, and spool")
+
+turbo:Slider("Turbo count", 2, 1, 0, 8, "", function(v)
+    State.turbos = math.floor(v + 0.5)
+end)
+turbo:Slider("Turbo boost", 24, 1, 0, 150, "", function(v)
+    State.turboBoost = v
+end)
+turbo:Slider("Turbo idle boost", 12, 1, 0, 60, "", function(v)
+    State.turboIdle = v
+end)
+turbo:Slider("Turbo peak RPM", 2800, 100, 1000, 15000, "", function(v)
+    State.turboPeakRPM = v
+end)
+turbo:Slider("Boost curve", 0.63, 0.01, 0.10, 1.50, "", function(v)
+    State.turboCurve = v
+end)
+turbo:Slider("Turbo efficiency", 5, 0.25, 1, 20, "", function(v)
+    State.turboEfficiency = v
+end)
+turbo:Slider("Spool up", 0.96, 0.01, 0.05, 2, "", function(v)
+    State.turboSpoolUp = v
+end)
+turbo:Slider("Spool down", 0.96, 0.01, 0.05, 2, "", function(v)
+    State.turboSpoolDown = v
+end)
+turbo:Button("Apply turbo tune", function()
+    applyTune(getCar(), true)
+end)
+
+local super = induction:Section("Superchargers", "Right", "count, boost curve, and response")
+super:Slider("Supercharger count", 1, 1, 0, 8, "", function(v)
+    State.superchargers = math.floor(v + 0.5)
+end)
+super:Slider("Super peak boost", 40.25, 0.25, 0, 150, "", function(v)
+    State.superPeakBoost = v
+end)
+super:Slider("Super peak RPM", 3000, 100, 1000, 15000, "", function(v)
+    State.superPeakRPM = v
+end)
+super:Slider("Super idle boost", 10, 1, 0, 80, "", function(v)
+    State.superIdleBoost = v
+end)
+super:Slider("Idle curve", 0.50, 0.01, 0.10, 1.50, "", function(v)
+    State.superIdleCurve = v
+end)
+super:Slider("Redline boost", 6, 1, 0, 80, "", function(v)
+    State.superRedlineBoost = v
+end)
+super:Slider("Redline curve", 0.50, 0.01, 0.10, 1.50, "", function(v)
+    State.superRedlineCurve = v
+end)
+super:Slider("Super efficiency", 11.27, 0.25, 1, 20, "", function(v)
+    State.superEfficiency = v
+end)
+super:Slider("Response", 0.60, 0.01, 0.05, 2, "", function(v)
+    State.superResponse = v
+end)
+super:Button("Apply supercharger tune", function()
+    applyTune(getCar(), true)
+end)
+
+local automation = win:Tab("Automation", "settings")
+local swerve = automation:Section("Swerve autofarm", "Left", "lane-aware traffic farming")
+
+swerve:Toggle("Autofarm enabled", false, function(on)
+    State.swerveEnabled = on
+    if on then State.enabled = true end
+    if on and State.swerveAutoEnter then
+        if not enterSwerveCourse(true) then
+            Lib:Notify("Swerve", "autofarm armed; waiting for the driver seat", 3, "warning")
+        end
+    else
+        Lib:Notify("Swerve", on and "autofarm armed" or "autofarm stopped", 2,
+            on and "success" or "warning")
+    end
+end)
+swerve:Toggle("Initialize on car spawn", true, function(on)
+    State.swerveAutoEnter = on
+end)
+swerve:Slider("Farm speed", 220, 10, 100, 400, "", function(v)
+    State.swerveSpeed = v
+end)
+swerve:Slider("Acceleration", 90, 5, 30, 180, "", function(v)
+    State.swerveAcceleration = v
+end)
+swerve:Slider("Avoid distance", 300, 10, 120, 500, "", function(v)
+    State.swerveAvoidDistance = v
+end)
+swerve:Slider("Lane-change speed", 18, 1, 8, 35, "", function(v)
+    State.swerveLaneSpeed = v
+end)
+swerve:Slider("Lane smoothing", 28, 1, 10, 60, "", function(v)
+    State.swerveLaneAcceleration = v
+end)
+swerve:Slider("Weave delay", 6, 0.5, 2, 12, "s", function(v)
+    State.swerveWeaveDelay = v
+end)
+swerve:Toggle("Keep car straight", true, function(on)
+    State.swerveKeepStraight = on
+    if on and currentRoot then
+        swerveLane = nearestSwerveLane(currentRoot.Position.X)
+    end
+end)
+swerve:Button("Initialize from current position", function()
+    _G.__CorsaStartSwerve()
+end)
+swerve:Button("Stop autofarm", function()
+    _G.__CorsaStopSwerve()
+end)
+swerve:Button("Stabilize current lane", function()
+    stabilizeSwerveCar(currentRoot)
+end)
+swerve:Button("Reapply traffic ghosting", function()
+    local changed = disableTrafficCollisions()
+    Lib:Notify("Swerve", tostring(changed) .. " AI traffic parts ghosted", 3, "success")
+end)
+swerve:Label(function()
+    return "Target lane: " .. tostring(swerveLane)
+end)
+swerve:Label(function()
+    if not State.swerveEnabled then return "Farm: stopped" end
+    if not currentRoot then return "Farm: waiting for car" end
+    if not State.enabled then return "Farm: master controller paused" end
+    return "Farm: running"
+end)
+swerve:Label("AI traffic collision: disabled")
+swerve:Label(function()
+    local gui = player:FindFirstChild("PlayerGui")
+    local purchase = gui and gui:FindFirstChild("PurchaseGUI")
+    local hesi = purchase and purchase:FindFirstChild("HesiUI")
+    local score = hesi and hesi:FindFirstChild("Score")
+    return "Swerve score: " .. (score and tostring(score.Text) or "0")
+end)
+
+local idle = automation:Section("Anti-AFK", "Right", "small input pulse while idle")
+idle:Toggle("Anti-AFK enabled", true, function(on)
+    State.antiAfk = on
+end)
+idle:Slider("Pulse interval", 55, 5, 30, 110, "s", function(v)
+    State.antiAfkInterval = v
+end)
+idle:Info("Sends a one-pixel mouse pulse at the selected interval. It does not press a driving key.")
+idle:Info("Swerve uses the game's real traffic, ScoreStart, telemetry, and payout flow. Enter the Swerve area normally, then enable the farm.")
+
 local system = win:Tab("System", "settings")
 local actions = system:Section("Actions", "Left")
 actions:Button("Apply complete tune", function()
@@ -291,6 +710,8 @@ actions:Button("Center menu", function()
 end)
 actions:Button("Stop controller", function()
     State.enabled = false
+    State.swerveEnabled = false
+    State.antiAfk = false
     _G.__CorsaBoost = false
     _G.__CorsaBoostToken = _G.__CorsaBoostToken + 1
     Lib:Notify("Corsa", "controller stopped", 2, "warning")
@@ -316,6 +737,41 @@ task.spawn(function()
     end
 end)
 
+task.spawn(function()
+    while _G.__CorsaBoostToken == token do
+        disableTrafficCollisions()
+        task.wait(0.40)
+    end
+end)
+
+task.spawn(function()
+    while _G.__CorsaBoostToken == token do
+        if State.swerveEnabled then
+            if State.swerveAutoEnter and currentCar and currentCar.Address ~= swerveCarAddress then
+                enterSwerveCourse(false)
+            end
+            updateSwerveLane()
+        end
+        task.wait(0.12)
+    end
+end)
+
+task.spawn(function()
+    local lastPulse = tick()
+
+    while _G.__CorsaBoostToken == token do
+        if State.antiAfk and tick() - lastPulse >= State.antiAfkInterval then
+            pcall(function()
+                mousemoverel(1, 0)
+                task.wait(0.05)
+                mousemoverel(-1, 0)
+            end)
+            lastPulse = tick()
+        end
+        task.wait(1)
+    end
+end)
+
 local existing = getCar()
 if existing then captureCar(existing) end
 
@@ -324,11 +780,15 @@ task.spawn(function()
 
     while _G.__CorsaBoostToken == token do
         local seat = currentSeat
+        local root = currentRoot
+        local orientation = seat or root
 
-        if State.enabled and seat then
-            local velocity = seat.AssemblyLinearVelocity
-            local forward = flatUnit(seat.CFrame.LookVector)
-            local right = flatUnit(seat.CFrame.RightVector)
+        if State.enabled and root and orientation then
+            local velocity = root.AssemblyLinearVelocity
+            local forward = State.swerveEnabled and swerveForward
+                or flatUnit(orientation.CFrame.LookVector)
+            local right = State.swerveEnabled and Vector3.new(1, 0, 0)
+                or flatUnit(orientation.CFrame.RightVector)
 
             if forward and right then
                 local horizontal = Vector3.new(velocity.X, 0, velocity.Z)
@@ -338,7 +798,42 @@ task.spawn(function()
                 local output = velocity
                 local changed = false
 
-                if math.abs(lateralSpeed) > 0.5 then
+                if State.swerveEnabled then
+                    local position = root.Position
+                    if position.Y < -15 then
+                        State.swerveEnabled = false
+                        if not swerveFaulted then
+                            swerveFaulted = true
+                            Lib:Notify(
+                                "Swerve stopped",
+                                "Vehicle fell below the road; respawn it before retrying",
+                                5,
+                                "error"
+                            )
+                        end
+                    else
+                        local targetX = swerveLanes[swerveLane]
+                        local desiredX = clamp(
+                            (targetX - position.X) * 2.5,
+                            -State.swerveLaneSpeed,
+                            State.swerveLaneSpeed
+                        )
+                        local lateralStep = State.swerveLaneAcceleration * dt
+                        local newX = output.X + clamp(
+                            desiredX - output.X,
+                            -lateralStep,
+                            lateralStep
+                        )
+                        local newZ = output.Z + clamp(
+                            State.swerveSpeed - output.Z,
+                            -State.swerveAcceleration * dt,
+                            State.swerveAcceleration * dt
+                        )
+                        local newY = math.min(output.Y, State.maxRise)
+                        output = Vector3.new(newX, newY, newZ)
+                        changed = true
+                    end
+                elseif math.abs(lateralSpeed) > 0.5 then
                     local rate = speed >= State.highSpeed
                         and State.highGripRate or State.lowGripRate
                     local correction = clamp(
@@ -355,7 +850,8 @@ task.spawn(function()
                     changed = true
                 end
 
-                local boosting = State.nitroEnabled and State.nitroHeld
+                local boosting = not State.swerveEnabled
+                    and State.nitroEnabled and State.nitroHeld
                 if boosting and forwardSpeed < State.maxSpeed then
                     local push = math.min(
                         State.accel * dt,
@@ -366,7 +862,7 @@ task.spawn(function()
                 end
 
                 if changed then
-                    seat.AssemblyLinearVelocity = output
+                    root.AssemblyLinearVelocity = output
                 end
             end
         end
