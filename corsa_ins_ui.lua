@@ -7,6 +7,10 @@ _G.__CorsaBoostToken = oldToken
 _G.__CorsaBoost = true
 _G.__CorsaHack = false
 
+if _G.__CorsaRestoreWheels then
+    pcall(_G.__CorsaRestoreWheels)
+end
+
 if _G.__CorsaUI then
     pcall(function() _G.__CorsaUI:Destroy() end)
 end
@@ -98,14 +102,17 @@ local State = {
     swerveSpeed = 220,
     swerveAcceleration = 90,
     swerveAvoidDistance = 300,
-    swerveLaneSpeed = 18,
-    swerveLaneAcceleration = 28,
-    swerveWeaveDelay = 6,
+    swerveLaneSpeed = 14,
+    swerveLaneAcceleration = 72,
+    swerveWeaveDelay = 1.0,
     swerveKeepStraight = true,
     trafficNoCollision = true,
     trafficDetected = 0,
     trafficAhead = math.huge,
     trafficGhosted = 0,
+    trafficModels = 0,
+    trafficCollidable = 0,
+    trafficPhaseActive = false,
     autoRetry = true,
     retryCount = 0,
 
@@ -132,13 +139,16 @@ local swerveFaulted = false
 local ghostedTrafficParts = {}
 local collisionParts = {}
 local collisionPartAddresses = {}
+local collisionModels = {}
+local collisionModelAddresses = {}
+local playerWheelParts = {}
 
 local win = Lib:CreateWindow({
     title = "Corsa Controller",
-    subtitle = "stable chassis + Swerve v11",
+    subtitle = "stable chassis + Swerve v13",
     size = Vector2.new(720, 540),
     menuKey = "p",
-    configName = "corsa-controller-v11",
+    configName = "corsa-controller-v13",
     configFolder = "corsa-controller",
     accentA = Color3.fromRGB(84, 168, 255),
     accentB = Color3.fromRGB(105, 255, 202),
@@ -366,6 +376,7 @@ local function enterSwerveCourse(notifyUser)
     end
 
     resolveSwerveCourse()
+    -- Lock the lane the player started in. Traffic never changes this target.
     swerveLane = nearestSwerveLane(root.Position.X)
     swerveNextWeave = tick() + State.swerveWeaveDelay
     swerveFaulted = false
@@ -405,6 +416,7 @@ end
 
 _G.__CorsaStopSwerve = function()
     State.swerveEnabled = false
+    if _G.__CorsaRestoreWheels then pcall(_G.__CorsaRestoreWheels) end
     Lib:Notify("Swerve", "autofarm stopped", 2, "warning")
 end
 
@@ -435,73 +447,168 @@ local function updateSwerveLane()
         end
     end
 
-    local now = tick()
-    local blocked = clearance[swerveLane] < State.swerveAvoidDistance
     State.trafficDetected = detected
     State.trafficAhead = clearance[swerveLane]
-    if not blocked and now < swerveNextWeave then return end
-
-    if not blocked and State.swerveKeepStraight then
-        swerveNextWeave = now + 0.25
-        return
-    end
-
-    local bestLane = swerveLane
-    local bestScore = -math.huge
-
-    for lane = 1, 3 do
-        local laneClearance = math.min(clearance[lane], State.swerveAvoidDistance * 3)
-        local changePenalty = math.abs(lane - swerveLane) * 12
-        local repeatPenalty = lane == swerveLane and (blocked and 80 or 25) or 0
-        local score = laneClearance - changePenalty - repeatPenalty
-
-        if score > bestScore then
-            bestLane = lane
-            bestScore = score
-        end
-    end
-
-    if not blocked then
-        local weaveLane = swerveLane % 3 + 1
-        if clearance[weaveLane] > State.swerveAvoidDistance * 0.8 then
-            bestLane = weaveLane
-        end
-    end
-
-    swerveLane = bestLane
-    swerveNextWeave = now + (blocked and 0.25 or State.swerveWeaveDelay)
 end
 
-local function disableTrafficCollisions()
-    if not State.trafficNoCollision then return 0 end
-
+local function getTrafficContainer()
     local traffic = game.Workspace:FindFirstChild("AITraffic")
-    local cars = traffic and traffic:FindFirstChild("Car")
-    if not cars then return 0 end
+    if not traffic then return nil end
 
-    local changed = 0
+    local direct = traffic:FindFirstChild("Car")
+    if direct then return direct end
+
+    -- Fall back to structure instead of relying on the folder retaining one name.
+    for _, folder in ipairs(traffic:GetChildren()) do
+        for _, candidate in ipairs(folder:GetChildren()) do
+            if candidate.ClassName == "Model"
+                and string.sub(candidate.Name, 1, 5) == "AICar" then
+                return folder
+            end
+        end
+    end
+end
+
+local function isTrafficPart(part)
+    local className = part.ClassName
+    return className == "Part"
+        or className == "MeshPart"
+        or className == "UnionOperation"
+end
+
+local function cacheTrafficModel(car)
+    local address = car.Address
+    if not address or collisionModelAddresses[address] then return 0 end
+
+    collisionModelAddresses[address] = true
+    collisionModels[#collisionModels + 1] = car
+    pcall(function() car:SetAttribute("CollisionEnforced", false) end)
+
+    local added = 0
+    for _, part in ipairs(car:GetDescendants()) do
+        if isTrafficPart(part) then
+            local partAddress = part.Address
+            if partAddress and not collisionPartAddresses[partAddress] then
+                collisionPartAddresses[partAddress] = true
+                collisionParts[#collisionParts + 1] = part
+                ghostedTrafficParts[partAddress] = true
+                added = added + 1
+            end
+            pcall(function() part.CanCollide = false end)
+        end
+    end
+
+    return added
+end
+
+local function discoverTrafficModels()
+    if not State.trafficNoCollision then return end
+    local cars = getTrafficContainer()
+    if not cars then return end
+
     for _, car in ipairs(cars:GetChildren()) do
-        for _, part in ipairs(car:GetDescendants()) do
-            if part.ClassName == "Part"
-                or part.ClassName == "MeshPart"
-                or part.ClassName == "UnionOperation" then
-                local address = part.Address
-                if not collisionPartAddresses[address] then
-                    collisionPartAddresses[address] = true
-                    collisionParts[#collisionParts + 1] = part
-                end
-                if not ghostedTrafficParts[address] or part.CanCollide then
-                    pcall(function() part.CanCollide = false end)
-                    ghostedTrafficParts[address] = true
-                    changed = changed + 1
+        cacheTrafficModel(car)
+    end
+end
+
+local function setPlayerTrafficPhase(active)
+    State.trafficPhaseActive = active == true
+    for i = 1, #playerWheelParts do
+        local wheel = playerWheelParts[i]
+        if wheel then
+            pcall(function() wheel.CanCollide = not State.trafficPhaseActive end)
+        end
+    end
+end
+
+_G.__CorsaRestoreWheels = function()
+    setPlayerTrafficPhase(false)
+end
+
+local function trafficOverlapImminent()
+    local root = currentRoot
+    if not (State.swerveEnabled and root) then return false end
+    if root.AssemblyLinearVelocity.Magnitude < 30 then return false end
+
+    local position = root.Position
+    for i = 1, #collisionModels do
+        local car = collisionModels[i]
+        if car then
+            local part = car.PrimaryPart or car:FindFirstChildWhichIsA("BasePart", true)
+            if part then
+                local ahead = part.Position.Z - position.Z
+                local lateral = math.abs(part.Position.X - position.X)
+                if ahead > -28 and ahead < 110 and lateral < 12 then
+                    return true
                 end
             end
         end
-        pcall(function() car:SetAttribute("CollisionEnforced", false) end)
     end
 
+    return false
+end
+
+local function enforceTrafficGhosting()
+    if not State.trafficNoCollision then
+        setPlayerTrafficPhase(false)
+        return
+    end
+
+    -- Discovery runs before physics. An AI car can no longer remain solid for
+    -- the old 0.15 second polling window after it spawns.
+    discoverTrafficModels()
+
+    for i = 1, #collisionModels do
+        local car = collisionModels[i]
+        if car then
+            pcall(function() car:SetAttribute("CollisionEnforced", false) end)
+        end
+    end
+
+    for i = 1, #collisionParts do
+        local part = collisionParts[i]
+        if part then
+            pcall(function()
+                if part.CanCollide then part.CanCollide = false end
+            end)
+        end
+    end
+
+    -- AI vehicles are server-driven. Phasing the player's wheel colliders for
+    -- only the overlap window removes the local side of the collision pair too.
+    -- Velocity control keeps the car level for this short pass-through window.
+    setPlayerTrafficPhase(trafficOverlapImminent())
+end
+
+local function rebuildTrafficCache()
+    collisionParts = {}
+    collisionPartAddresses = {}
+    collisionModels = {}
+    collisionModelAddresses = {}
+    ghostedTrafficParts = {}
+
+    discoverTrafficModels()
+    enforceTrafficGhosting()
+
+    local remaining = 0
+    for i = 1, #collisionParts do
+        local part = collisionParts[i]
+        if part then
+            pcall(function()
+                if part.CanCollide then remaining = remaining + 1 end
+            end)
+        end
+    end
+
+    State.trafficModels = #collisionModels
     State.trafficGhosted = #collisionParts
-    return changed
+    State.trafficCollidable = remaining
+    return #collisionModels, #collisionParts, remaining
+end
+
+local function disableTrafficCollisions()
+    local _, parts = rebuildTrafficCache()
+    return parts
 end
 
 local function getSwerveGui()
@@ -552,6 +659,8 @@ end
 _G.__CorsaRetrySwerve = clickSwerveRetry
 
 local function captureCar(car)
+    setPlayerTrafficPhase(false)
+    playerWheelParts = {}
     currentCar = car
     currentAddress = car and car.Address
     currentSeat = nil
@@ -561,6 +670,14 @@ local function captureCar(car)
         applyTune(car, false)
         currentSeat = findSeat(car)
         currentRoot = findVehicleRoot(car)
+        local wheels = car:FindFirstChild("Wheels")
+        if wheels then
+            for _, wheel in ipairs(wheels:GetChildren()) do
+                if isTrafficPart(wheel) then
+                    playerWheelParts[#playerWheelParts + 1] = wheel
+                end
+            end
+        end
         Lib:Notify("Vehicle ready", car.Name, 2, "success")
 
         if State.swerveEnabled and State.swerveAutoEnter then
@@ -734,7 +851,7 @@ super:Button("Apply supercharger tune", function()
 end)
 
 local automation = win:Tab("Automation", "settings")
-local swerve = automation:Section("Swerve autofarm", "Left", "lane-aware traffic farming")
+local swerve = automation:Section("Swerve autofarm", "Left", "fixed-lane traffic phasing")
 
 swerve:Toggle("Autofarm enabled", false, function(on)
     State.swerveEnabled = on
@@ -757,24 +874,13 @@ end)
 swerve:Slider("Acceleration", 90, 5, 30, 180, "", function(v)
     State.swerveAcceleration = v
 end)
-swerve:Slider("Avoid distance", 300, 10, 120, 500, "", function(v)
-    State.swerveAvoidDistance = v
-end)
-swerve:Slider("Lane-change speed", 18, 1, 8, 35, "", function(v)
+swerve:Slider("Lane centering speed", 14, 1, 8, 24, "", function(v)
     State.swerveLaneSpeed = v
 end)
-swerve:Slider("Lane smoothing", 28, 1, 10, 60, "", function(v)
+swerve:Slider("Lane centering brake", 72, 2, 30, 100, "", function(v)
     State.swerveLaneAcceleration = v
 end)
-swerve:Slider("Weave delay", 6, 0.5, 2, 12, "s", function(v)
-    State.swerveWeaveDelay = v
-end)
-swerve:Toggle("Stay in lane until blocked", true, function(on)
-    State.swerveKeepStraight = on
-    if on and currentRoot then
-        swerveLane = nearestSwerveLane(currentRoot.Position.X)
-    end
-end)
+swerve:Info("Fixed-lane mode: traffic never changes the selected lane. AI cars and the player's wheels are phased only during overlap.")
 swerve:Button("Initialize from current position", function()
     _G.__CorsaStartSwerve()
 end)
@@ -793,8 +899,14 @@ swerve:Button("Click Retry now", function()
     end
 end)
 swerve:Button("Reapply traffic ghosting", function()
-    local changed = disableTrafficCollisions()
-    Lib:Notify("Swerve", tostring(changed) .. " AI traffic parts ghosted", 3, "success")
+    local models, parts, remaining = rebuildTrafficCache()
+    Lib:Notify(
+        "Swerve",
+        tostring(models) .. " AI cars found; " .. tostring(parts)
+            .. " parts held non-collidable; " .. tostring(remaining) .. " remaining",
+        4,
+        remaining == 0 and "success" or "warning"
+    )
 end)
 swerve:Label(function()
     return "Target lane: " .. tostring(swerveLane)
@@ -805,13 +917,22 @@ swerve:Label(function()
     if not State.enabled then return "Farm: master controller paused" end
     return "Farm: running"
 end)
-swerve:Label("AI traffic collision: disabled")
+swerve:Label(function()
+    return "AI traffic: " .. tostring(State.trafficModels) .. " cars | "
+        .. tostring(State.trafficGhosted) .. " parts | "
+        .. tostring(State.trafficCollidable) .. " collidable remaining"
+end)
+swerve:Label(function()
+    return State.trafficPhaseActive
+        and "Player collision: phased through nearby AI"
+        or "Player collision: normal road grip"
+end)
 swerve:Label(function()
     local ahead = State.trafficAhead
     local nearest = ahead == math.huge and "clear" or (tostring(math.floor(ahead + 0.5)) .. " studs")
     return "Traffic: " .. tostring(State.trafficDetected)
         .. " tracked | target lane " .. nearest
-        .. " | " .. tostring(State.trafficGhosted) .. " parts ghosted"
+        .. " | pre-physics ghosting active"
 end)
 swerve:Label(function()
     return "Retries recovered: " .. tostring(State.retryCount)
@@ -846,6 +967,7 @@ actions:Button("Stop controller", function()
     State.antiAfk = false
     _G.__CorsaBoost = false
     _G.__CorsaBoostToken = _G.__CorsaBoostToken + 1
+    if _G.__CorsaRestoreWheels then pcall(_G.__CorsaRestoreWheels) end
     Lib:Notify("Corsa", "controller stopped", 2, "warning")
 end):SetRisk()
 
@@ -871,8 +993,8 @@ end)
 
 task.spawn(function()
     while _G.__CorsaBoostToken == token do
-        disableTrafficCollisions()
-        task.wait(0.15)
+        rebuildTrafficCache()
+        task.wait(1.0)
     end
 end)
 
@@ -888,21 +1010,30 @@ task.spawn(function()
     end
 end)
 
+local runService = game:GetService("RunService")
+local collisionStepped
 local collisionHeartbeat
-collisionHeartbeat = game:GetService("RunService").Heartbeat:Connect(function()
+
+collisionStepped = runService.Stepped:Connect(function()
     if _G.__CorsaBoostToken ~= token then
+        setPlayerTrafficPhase(false)
+        collisionStepped:Disconnect()
+        return
+    end
+
+    enforceTrafficGhosting()
+end)
+
+collisionHeartbeat = runService.Heartbeat:Connect(function()
+    if _G.__CorsaBoostToken ~= token then
+        setPlayerTrafficPhase(false)
         collisionHeartbeat:Disconnect()
         return
     end
 
-    if not State.trafficNoCollision then return end
-
-    for i = 1, #collisionParts do
-        local part = collisionParts[i]
-        if part and part.CanCollide then
-            pcall(function() part.CanCollide = false end)
-        end
-    end
+    -- The second pass catches anything the game's speed-based traffic toggle
+    -- changed during the frame. The Stepped pass is the one that protects physics.
+    enforceTrafficGhosting()
 end)
 
 task.spawn(function()
@@ -973,13 +1104,32 @@ task.spawn(function()
                             )
                         end
                     else
-                        local targetX = swerveLanes[swerveLane]
-                        local desiredX = clamp(
-                            (targetX - position.X) * 2.5,
-                            -State.swerveLaneSpeed,
-                            State.swerveLaneSpeed
+                        local laneGap = math.min(
+                            swerveLanes[2] - swerveLanes[1],
+                            swerveLanes[3] - swerveLanes[2]
                         )
-                        local lateralStep = State.swerveLaneAcceleration * dt
+                        local safeMargin = math.max(2, laneGap * 0.22)
+                        local safeLeft = swerveLanes[1] - safeMargin
+                        local safeRight = swerveLanes[3] + safeMargin
+
+                        local targetX = clamp(
+                            swerveLanes[swerveLane],
+                            safeLeft,
+                            safeRight
+                        )
+                        local lateralError = targetX - position.X
+                        local stoppingSpeed = math.sqrt(math.max(
+                            0,
+                            2 * State.swerveLaneAcceleration * math.abs(lateralError)
+                        ))
+                        local desiredX = math.min(State.swerveLaneSpeed, stoppingSpeed)
+                        if lateralError < 0 then desiredX = -desiredX end
+                        if math.abs(lateralError) < 0.25 then desiredX = 0 end
+
+                        local lateralStep = math.min(
+                            State.swerveLaneAcceleration * dt,
+                            5
+                        )
                         local newX = output.X + clamp(
                             desiredX - output.X,
                             -lateralStep,
@@ -990,8 +1140,16 @@ task.spawn(function()
                             -State.swerveAcceleration * dt,
                             State.swerveAcceleration * dt
                         )
-                        local newY = math.min(output.Y, State.maxRise)
+                        local newY = State.trafficPhaseActive
+                            and 0 or clamp(output.Y, -3, State.maxRise)
                         output = Vector3.new(newX, newY, newZ)
+
+                        -- The game fails Swerve when speed changes by 10 or more
+                        -- in one frame. Keep every controller correction below it.
+                        local velocityDelta = output - velocity
+                        if velocityDelta.Magnitude > 7.5 then
+                            output = velocity + velocityDelta.Unit * 7.5
+                        end
                         changed = true
                     end
                 elseif math.abs(lateralSpeed) > 0.5 then
