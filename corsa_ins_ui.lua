@@ -375,6 +375,13 @@ local function enterSwerveCourse(notifyUser)
         return false
     end
 
+    -- Retry can rebuild the A-Chassis internals without replacing the outer car
+    -- model. Always promote the freshly resolved seat/root into the controller.
+    currentCar = car
+    currentAddress = car.Address
+    currentSeat = seat
+    currentRoot = root
+
     resolveSwerveCourse()
     -- Lock the lane the player started in. Traffic never changes this target.
     swerveLane = nearestSwerveLane(root.Position.X)
@@ -982,8 +989,12 @@ task.spawn(function()
     while _G.__CorsaBoostToken == token do
         local car = getCar()
         local address = car and car.Address
+        local liveRoot = car and findVehicleRoot(car)
+        local liveRootAddress = liveRoot and liveRoot.Address
+        local cachedRootAddress = currentRoot and currentRoot.Address
 
-        if address ~= currentAddress then
+        if address ~= currentAddress
+            or liveRootAddress ~= cachedRootAddress then
             captureCar(car)
         end
 
