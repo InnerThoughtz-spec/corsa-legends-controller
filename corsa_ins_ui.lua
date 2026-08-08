@@ -116,6 +116,10 @@ local State = {
     trafficModels = 0,
     trafficCollidable = 0,
     trafficProxiesDetached = 0,
+    crashGuard = true,
+    crashGuardActive = false,
+    crashGuardDistance = 120,
+    crashGuardSpeed = 0,
     autoRetry = true,
     retryCount = 0,
 
@@ -148,13 +152,15 @@ local collisionModelAddresses = {}
 local playerWheelParts = {}
 local detachedTrafficProxies = {}
 local detachedTrafficProxyAddresses = {}
+local lastCharacterSpeed
+local lastCrashGuardWrite = 0
 
 local win = Lib:CreateWindow({
     title = "Corsa Controller",
-    subtitle = "stable chassis + Swerve v14",
+    subtitle = "stable chassis + Swerve v15",
     size = Vector2.new(720, 540),
     menuKey = "p",
-    configName = "corsa-controller-v14",
+    configName = "corsa-controller-v15",
     configFolder = "corsa-controller",
     accentA = Color3.fromRGB(84, 168, 255),
     accentB = Color3.fromRGB(105, 255, 202),
@@ -596,6 +602,81 @@ local function enforceTrafficGhosting()
     restorePlayerWheels()
 end
 
+local function getCharacterRoot()
+    local character = player.Character
+    return character and character:FindFirstChild("HumanoidRootPart")
+end
+
+local function trafficIsClose(root)
+    if not root then return false end
+    local position = root.Position
+
+    for i = 1, #collisionModels do
+        local car = collisionModels[i]
+        local part = car and car.PrimaryPart
+        if part then
+            local ahead = part.Position.Z - position.Z
+            local lateral = math.abs(part.Position.X - position.X)
+            if ahead > -35
+                and ahead < State.crashGuardDistance
+                and lateral < 12 then
+                return true
+            end
+        end
+    end
+
+    return false
+end
+
+local function enforceCrashGuard()
+    local root = currentRoot
+    local characterRoot = getCharacterRoot()
+    local active = State.crashGuard
+        and State.swerveEnabled
+        and root
+        and characterRoot
+        and trafficIsClose(root)
+
+    State.crashGuardActive = active == true
+    if not active then return end
+
+    local now = tick()
+    if now - lastCrashGuardWrite < 1 / 30 then return end
+    lastCrashGuardWrite = now
+
+    local stableSpeed = lastCharacterSpeed or characterRoot.Velocity.Magnitude
+    if stableSpeed < 30 then return end
+
+    local velocity = root.AssemblyLinearVelocity
+    local lateral = clamp(
+        velocity.X,
+        -State.swerveLaneSpeed,
+        State.swerveLaneSpeed
+    )
+    local forward = math.sqrt(math.max(0, stableSpeed * stableSpeed - lateral * lateral))
+    local guardedVelocity = Vector3.new(lateral, 0, forward)
+
+    pcall(function()
+        characterRoot.Velocity = guardedVelocity
+    end)
+    State.crashGuardSpeed = stableSpeed
+end
+
+local function updateCharacterSpeedReference()
+    local characterRoot = getCharacterRoot()
+    if not characterRoot then
+        lastCharacterSpeed = nil
+        State.crashGuardSpeed = 0
+        return
+    end
+
+    local speed = characterRoot.Velocity.Magnitude
+    if not lastCharacterSpeed or math.abs(speed - lastCharacterSpeed) < 8 then
+        lastCharacterSpeed = speed
+        State.crashGuardSpeed = speed
+    end
+end
+
 local function rebuildTrafficCache()
     collisionParts = {}
     collisionPartAddresses = {}
@@ -909,6 +990,10 @@ end)
 swerve:Toggle("Auto-click Retry", true, function(on)
     State.autoRetry = on
 end)
+swerve:Toggle("Crash detector guard", true, function(on)
+    State.crashGuard = on
+    if not on then State.crashGuardActive = false end
+end)
 swerve:Button("Click Retry now", function()
     if not clickSwerveRetry() then
         Lib:Notify("Swerve", "Retry screen is not active", 2, "warning")
@@ -941,6 +1026,12 @@ end)
 swerve:Label(function()
     return "AI hitboxes removed: " .. tostring(State.trafficProxiesDetached)
         .. " | player wheels: always solid"
+end)
+swerve:Label(function()
+    local speed = math.floor((State.crashGuardSpeed or 0) * 10 + 0.5) / 10
+    return State.crashGuardActive
+        and ("Crash detector guard: ACTIVE at " .. tostring(speed))
+        or ("Crash detector guard: armed | reference " .. tostring(speed))
 end)
 swerve:Label(function()
     local ahead = State.trafficAhead
@@ -1045,6 +1136,7 @@ collisionStepped = runService.Stepped:Connect(function()
     end
 
     enforceTrafficGhosting()
+    enforceCrashGuard()
 end)
 
 collisionHeartbeat = runService.Heartbeat:Connect(function()
@@ -1057,6 +1149,7 @@ collisionHeartbeat = runService.Heartbeat:Connect(function()
     -- The second pass catches anything the game's speed-based traffic toggle
     -- changed during the frame. The Stepped pass is the one that protects physics.
     enforceTrafficGhosting()
+    updateCharacterSpeedReference()
 end)
 
 task.spawn(function()
