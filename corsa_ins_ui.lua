@@ -86,6 +86,7 @@ local State = {
     preload = 0.35,
     stiffness = 58,
     damping = 8600,
+    horsepowerLimit = 999999999,
 
     turbos = 2,
     turboBoost = 24,
@@ -147,6 +148,11 @@ local State = {
     payoutCycles = 0,
     payoutInProgress = false,
 
+    fullTuneStatCount = 0,
+    fullTuneOverrideCount = 0,
+    fullTuneSelected = "none",
+    fullTuneSelectedType = "none",
+
     antiAfk = true,
     antiAfkInterval = 55,
 }
@@ -190,13 +196,21 @@ local lastRetryClick = 0
 local lastObservedSwerveScore = 0
 local retryArmedUntil = 0
 local retryDetectionSuppressedUntil = 0
+local fullTuneOverrides = {}
+local fullTuneOriginals = {}
+local fullTuneNames = {}
+local fullTuneCarKey
+local fullTuneSelected
+local fullTunePendingValue = ""
+local fullTuneDropdown
+local fullTuneValueBox
 
 local win = Lib:CreateWindow({
     title = "Corsa Controller",
-    subtitle = "stable chassis + Swerve v19",
+    subtitle = "stable chassis + Swerve v20",
     size = Vector2.new(720, 540),
     menuKey = "p",
-    configName = "corsa-controller-v19",
+    configName = "corsa-controller-v20",
     configFolder = "corsa-controller",
     accentA = Color3.fromRGB(84, 168, 255),
     accentB = Color3.fromRGB(105, 255, 202),
@@ -245,7 +259,7 @@ local function buildTune()
         peakTqRPM = "8000",
         redline = "30000",
         shiftRPM = "28000",
-        bhpLimit = "999999999",
+        bhpLimit = tostring(State.horsepowerLimit),
         Turbochargers = tostring(State.turbos),
         TBoost = tostring(State.turboBoost),
         TIdle = tostring(State.turboIdle),
@@ -333,6 +347,231 @@ local function applyTune(car, notifyUser)
     end
 
     return true
+end
+
+local editableValueClasses = {
+    StringValue = true,
+    NumberValue = true,
+    IntValue = true,
+    BoolValue = true,
+}
+
+local function safeTuneText(value)
+    local text = tostring(value == nil and "" or value)
+    text = text:gsub("[%z\1-\8\11\12\14-\31]", "?")
+    if #text > 160 then text = text:sub(1, 160) end
+    return text
+end
+
+local function getStatsFolder(car)
+    return car and car:FindFirstChild("Stats")
+end
+
+local function relativeStatPath(stats, stat)
+    local prefix = stats:GetFullName() .. "."
+    local fullName = stat:GetFullName()
+    if fullName:sub(1, #prefix) == prefix then
+        return fullName:sub(#prefix + 1)
+    end
+    return stat.Name
+end
+
+local function resolveStat(car, path)
+    local node = getStatsFolder(car)
+    if not (node and path and path ~= "") then return nil end
+    for segment in tostring(path):gmatch("[^%.]+") do
+        node = node and node:FindFirstChild(segment)
+        if not node then return nil end
+    end
+    return node
+end
+
+local function recountFullTuneOverrides()
+    local count = 0
+    for _ in pairs(fullTuneOverrides) do count = count + 1 end
+    State.fullTuneOverrideCount = count
+    return count
+end
+
+local function coerceStatValue(stat, text)
+    local className = stat.ClassName
+    if className == "StringValue" then
+        return true, tostring(text or "")
+    elseif className == "NumberValue" then
+        local number = tonumber(text)
+        if number == nil then return false, nil, "Enter a valid number" end
+        return true, number
+    elseif className == "IntValue" then
+        local number = tonumber(text)
+        if number == nil then return false, nil, "Enter a valid integer" end
+        number = number >= 0 and math.floor(number + 0.5)
+            or math.ceil(number - 0.5)
+        return true, number
+    elseif className == "BoolValue" then
+        local value = tostring(text or ""):lower()
+        if value == "true" or value == "1" or value == "yes" or value == "on" then
+            return true, true
+        elseif value == "false" or value == "0" or value == "no" or value == "off" then
+            return true, false
+        end
+        return false, nil, "Use true/false, 1/0, yes/no, or on/off"
+    end
+    return false, nil, "Unsupported value type: " .. tostring(className)
+end
+
+local function writeFullTuneStat(car, path, text, remember, notifyUser)
+    local stat = resolveStat(car, path)
+    if not (stat and editableValueClasses[stat.ClassName]) then
+        if notifyUser then
+            Lib:Notify("Full tune", "Stat is unavailable on the current car", 3, "error")
+        end
+        return false
+    end
+
+    local valid, value, message = coerceStatValue(stat, text)
+    if not valid then
+        if notifyUser then Lib:Notify("Full tune", message, 3, "error") end
+        return false
+    end
+
+    local ok = pcall(function() stat.Value = value end)
+    if not ok then
+        if notifyUser then
+            Lib:Notify("Full tune", "The game rejected that value", 3, "error")
+        end
+        return false
+    end
+
+    if remember then
+        fullTuneOverrides[path] = {
+            className = stat.ClassName,
+            value = value,
+        }
+        recountFullTuneOverrides()
+    end
+
+    if path == "bhpLimit" then
+        local hp = tonumber(value)
+        if hp then State.horsepowerLimit = hp end
+    end
+    if notifyUser then
+        Lib:Notify(
+            "Full tune",
+            tostring(path) .. " = " .. safeTuneText(value),
+            3,
+            "success"
+        )
+    end
+    return true
+end
+
+local function selectFullTuneStat(path)
+    local stat = resolveStat(getCar(), path)
+    fullTuneSelected = path
+    State.fullTuneSelected = path or "none"
+    State.fullTuneSelectedType = stat and stat.ClassName or "unavailable"
+    fullTunePendingValue = stat and safeTuneText(stat.Value) or ""
+    if fullTuneValueBox then fullTuneValueBox:Set(fullTunePendingValue) end
+end
+
+local function refreshFullTuneCatalog(car, resetOriginals)
+    local stats = getStatsFolder(car)
+    if not stats then
+        fullTuneNames = {}
+        State.fullTuneStatCount = 0
+        if fullTuneDropdown then fullTuneDropdown:UpdateChoices({}) end
+        return 0
+    end
+
+    local carKey = tostring(car.Address or car.Name)
+    if resetOriginals or carKey ~= fullTuneCarKey then
+        fullTuneOriginals = {}
+        fullTuneCarKey = carKey
+    end
+
+    local names = {}
+    for _, stat in ipairs(stats:GetDescendants()) do
+        if editableValueClasses[stat.ClassName] then
+            local path = relativeStatPath(stats, stat)
+            names[#names + 1] = path
+            if fullTuneOriginals[path] == nil then
+                fullTuneOriginals[path] = {
+                    className = stat.ClassName,
+                    value = stat.Value,
+                }
+            end
+        end
+    end
+    table.sort(names, function(a, b) return a:lower() < b:lower() end)
+    fullTuneNames = names
+    State.fullTuneStatCount = #names
+
+    if fullTuneDropdown then fullTuneDropdown:UpdateChoices(names) end
+    local selectedStillExists = fullTuneSelected
+        and resolveStat(car, fullTuneSelected) ~= nil
+    if not selectedStillExists then fullTuneSelected = names[1] end
+    if fullTuneSelected then
+        if fullTuneDropdown then fullTuneDropdown:Set({ fullTuneSelected }) end
+        selectFullTuneStat(fullTuneSelected)
+    end
+    return #names
+end
+
+local function applyFullTuneOverrides(car)
+    local changed = 0
+    for path, entry in pairs(fullTuneOverrides) do
+        if writeFullTuneStat(car, path, entry.value, false, false) then
+            changed = changed + 1
+        end
+    end
+    return changed
+end
+
+local function restoreSelectedFullTuneStat()
+    local original = fullTuneSelected and fullTuneOriginals[fullTuneSelected]
+    if not original then return false end
+    local restored = writeFullTuneStat(
+        getCar(),
+        fullTuneSelected,
+        original.value,
+        false,
+        false
+    )
+    if restored then
+        fullTuneOverrides[fullTuneSelected] = nil
+        recountFullTuneOverrides()
+        selectFullTuneStat(fullTuneSelected)
+    end
+    return restored
+end
+
+local function restoreAllFullTuneStats()
+    local car = getCar()
+    local restored = 0
+    for path, original in pairs(fullTuneOriginals) do
+        if writeFullTuneStat(car, path, original.value, false, false) then
+            restored = restored + 1
+        end
+    end
+    fullTuneOverrides = {}
+    recountFullTuneOverrides()
+    if fullTuneSelected then selectFullTuneStat(fullTuneSelected) end
+    return restored
+end
+
+_G.__CorsaSetStat = function(path, value)
+    return writeFullTuneStat(getCar(), tostring(path or ""), value, true, true)
+end
+
+_G.__CorsaRefreshStats = function()
+    return refreshFullTuneCatalog(getCar(), false)
+end
+
+_G.__CorsaListStats = function()
+    refreshFullTuneCatalog(getCar(), false)
+    local copy = {}
+    for i = 1, #fullTuneNames do copy[i] = fullTuneNames[i] end
+    return copy
 end
 
 local function findSeat(car)
@@ -1097,7 +1336,10 @@ local function captureCar(car)
     currentRoot = nil
 
     if car then
+        refreshFullTuneCatalog(car, true)
         applyTune(car, false)
+        applyFullTuneOverrides(car)
+        refreshFullTuneCatalog(car, false)
         currentSeat = findSeat(car)
         currentRoot = findVehicleRoot(car)
         local wheels = car:FindFirstChild("Wheels")
@@ -1280,6 +1522,186 @@ end)
 super:Button("Apply supercharger tune", function()
     applyTune(getCar(), true)
 end)
+
+local fullTune = win:Tab("Full Tune", "sliders")
+local powerTune = fullTune:Section(
+    "Powertrain quick tune",
+    "Left",
+    "horsepower, torque, and RPM limits"
+)
+
+local function liveStatText(path, fallback)
+    local stat = resolveStat(getCar(), path)
+    return stat and safeTuneText(stat.Value) or tostring(fallback)
+end
+
+local powerInputs = {
+    bhpLimit = liveStatText("bhpLimit", State.horsepowerLimit),
+    peakTq = liveStatText("peakTq", 12000),
+    redlineTq = liveStatText("redlineTq", 9000),
+    idleTq = liveStatText("idleTq", 1200),
+    peakTqRPM = liveStatText("peakTqRPM", 8000),
+    redline = liveStatText("redline", 30000),
+    shiftRPM = liveStatText("shiftRPM", 28000),
+}
+
+powerTune:Textbox("Horsepower limit", powerInputs.bhpLimit, function(v)
+    powerInputs.bhpLimit = v
+end, "Edits the car's bhpLimit value")
+powerTune:Textbox("Peak torque", powerInputs.peakTq, function(v)
+    powerInputs.peakTq = v
+end)
+powerTune:Textbox("Redline torque", powerInputs.redlineTq, function(v)
+    powerInputs.redlineTq = v
+end)
+powerTune:Textbox("Idle torque", powerInputs.idleTq, function(v)
+    powerInputs.idleTq = v
+end)
+powerTune:Textbox("Peak torque RPM", powerInputs.peakTqRPM, function(v)
+    powerInputs.peakTqRPM = v
+end)
+powerTune:Textbox("Redline RPM", powerInputs.redline, function(v)
+    powerInputs.redline = v
+end)
+powerTune:Textbox("Shift RPM", powerInputs.shiftRPM, function(v)
+    powerInputs.shiftRPM = v
+end)
+
+powerTune:Button("Apply complete power tune", function()
+    local fields = {
+        { "bhpLimit", powerInputs.bhpLimit },
+        { "peakTq", powerInputs.peakTq },
+        { "redlineTq", powerInputs.redlineTq },
+        { "idleTq", powerInputs.idleTq },
+        { "peakTqRPM", powerInputs.peakTqRPM },
+        { "redline", powerInputs.redline },
+        { "shiftRPM", powerInputs.shiftRPM },
+    }
+
+    for _, field in ipairs(fields) do
+        if tonumber(field[2]) == nil then
+            Lib:Notify(
+                "Power tune",
+                tostring(field[1]) .. " needs a valid number",
+                3,
+                "error"
+            )
+            return
+        end
+    end
+    if tonumber(powerInputs.bhpLimit) <= 0 then
+        Lib:Notify("Power tune", "Horsepower must be above zero", 3, "error")
+        return
+    end
+
+    local applied = 0
+    for _, field in ipairs(fields) do
+        if writeFullTuneStat(getCar(), field[1], field[2], true, false) then
+            applied = applied + 1
+        end
+    end
+    refreshFullTuneCatalog(getCar(), false)
+    Lib:Notify(
+        "Power tune",
+        tostring(applied) .. "/" .. tostring(#fields)
+            .. " power values applied and saved for respawn",
+        4,
+        applied == #fields and "success" or "warning"
+    )
+end)
+powerTune:Info(
+    "These limits are applied immediately. The game's drivetrain may need a vehicle respawn before every change is reflected."
+)
+
+local everyStat = fullTune:Section(
+    "Every car stat",
+    "Right",
+    "search all values exposed by this vehicle"
+)
+
+refreshFullTuneCatalog(getCar(), false)
+local initialFullTuneChoices = #fullTuneNames > 0
+    and fullTuneNames or { "No car Stats folder detected" }
+
+fullTuneDropdown = everyStat:Dropdown(
+    "Search/select stat",
+    fullTuneSelected and { fullTuneSelected } or {},
+    initialFullTuneChoices,
+    false,
+    function(values)
+        local selected = values and values[1]
+        if selected and resolveStat(getCar(), selected) then
+            selectFullTuneStat(selected)
+        end
+    end,
+    "Search by stat name, then select one to edit",
+    true
+)
+
+fullTuneValueBox = everyStat:Textbox(
+    "Selected value",
+    fullTunePendingValue,
+    function(v)
+        fullTunePendingValue = v
+    end,
+    "Numbers use ordinary decimal text; booleans accept true/false or 1/0"
+)
+
+everyStat:Button("Apply selected value", function()
+    if not fullTuneSelected then
+        Lib:Notify("Full tune", "Select a stat first", 3, "error")
+        return
+    end
+    if writeFullTuneStat(
+        getCar(),
+        fullTuneSelected,
+        fullTunePendingValue,
+        true,
+        true
+    ) then
+        selectFullTuneStat(fullTuneSelected)
+    end
+end)
+
+everyStat:Button("Reload stat list and current value", function()
+    local count = refreshFullTuneCatalog(getCar(), false)
+    Lib:Notify(
+        "Full tune",
+        tostring(count) .. " editable values found on this car",
+        3,
+        count > 0 and "success" or "warning"
+    )
+end)
+
+everyStat:Button("Restore selected session value", function()
+    if restoreSelectedFullTuneStat() then
+        Lib:Notify("Full tune", "Selected stat restored", 3, "success")
+    else
+        Lib:Notify("Full tune", "No session backup for that stat", 3, "error")
+    end
+end)
+
+everyStat:Button("Restore all session values", function()
+    local restored = restoreAllFullTuneStats()
+    Lib:Notify(
+        "Full tune",
+        tostring(restored) .. " values restored; custom overrides cleared",
+        4,
+        restored > 0 and "success" or "warning"
+    )
+end)
+
+everyStat:Label(function()
+    return "Car stats: " .. tostring(State.fullTuneStatCount)
+        .. " | staged overrides: " .. tostring(State.fullTuneOverrideCount)
+end)
+everyStat:Label(function()
+    return "Selected: " .. tostring(State.fullTuneSelected)
+        .. " [" .. tostring(State.fullTuneSelectedType) .. "]"
+end)
+everyStat:Info(
+    "The list is generated from the current car, including drivetrain, gears, boost, tires, suspension, steering, brakes, weight, sounds, IDs, and model-specific settings."
+)
 
 local automation = win:Tab("Automation", "settings")
 local swerve = automation:Section("Swerve autofarm", "Left", "safe-lane traffic phasing")
