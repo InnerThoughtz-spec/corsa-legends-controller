@@ -64,7 +64,7 @@ local MPH_PER_STUD_PER_SECOND = 0.626342
 local SWERVE_MAX_MPH = 370
 local MICRO_SWERVE_MAX_WIDTH = 1.75
 local MICRO_SWERVE_MAX_HOLD = 0.18
-local SWERVE_MAX_LATERAL_SPEED = 6
+local SWERVE_MAX_LATERAL_SPEED = 5
 local SWERVE_MAX_LATERAL_ACCELERATION = 36
 
 local State = {
@@ -112,7 +112,7 @@ local State = {
     swerveTargetMPH = SWERVE_MAX_MPH,
     swerveSpeed = SWERVE_MAX_MPH / MPH_PER_STUD_PER_SECOND,
     swerveAcceleration = 150,
-    swerveLaneSpeed = 6,
+    swerveLaneSpeed = 5,
     swerveLaneAcceleration = 36,
     microSwerveEnabled = true,
     microSwerveWidth = 1.25,
@@ -124,7 +124,7 @@ local State = {
     microSwerveCount = 0,
     laneAlternation = true,
     laneSwitchPause = 0.85,
-    laneTransitionSpeed = 6,
+    laneTransitionSpeed = 5,
     laneTransitionAcceleration = 30,
     laneSwitching = false,
     groundTrackLock = false,
@@ -244,10 +244,10 @@ local groundLockToggle
 
 local win = Lib:CreateWindow({
     title = "Corsa Controller",
-    subtitle = "hard left-rail guard + motion-confirmed Retry v26",
+    subtitle = "axis-separated lane control + verified Retry v27",
     size = Vector2.new(720, 540),
     menuKey = "p",
-    configName = "corsa-controller-v26",
+    configName = "corsa-controller-v27",
     configFolder = "corsa-controller",
     accentA = Color3.fromRGB(84, 168, 255),
     accentB = Color3.fromRGB(105, 255, 202),
@@ -1071,10 +1071,8 @@ local function buildLegacySwerveVelocity(velocity, position, dt)
         clamp(velocity.Y, -3, State.maxRise),
         newZ
     )
-    local delta = output - velocity
-    if delta.Magnitude > 7.5 then
-        output = velocity + delta.Unit * 7.5
-    end
+    -- Forward acceleration and lateral centering have independent limits.
+    -- Combining them into one delta cap delayed X sign reversals at high speed.
     return output
 end
 
@@ -1133,19 +1131,8 @@ local function buildExperimentalSwerveVelocity(root, velocity, dt)
         State.swerveAcceleration * dt
     )
     local output = Vector3.new(newX, newY, newZ)
-    local horizontalDelta = Vector3.new(
-        output.X - velocity.X,
-        0,
-        output.Z - velocity.Z
-    )
-    if horizontalDelta.Magnitude > 7.5 then
-        local limited = horizontalDelta.Unit * 7.5
-        output = Vector3.new(
-            velocity.X + limited.X,
-            newY,
-            velocity.Z + limited.Z
-        )
-    end
+    -- Keep the vertical, lateral, and forward controllers independent so one
+    -- axis can never consume another axis's correction budget.
     return output
 end
 
@@ -2220,7 +2207,7 @@ end)
 swerve:Slider("Acceleration", 150, 5, 30, 240, "", function(v)
     State.swerveAcceleration = v
 end)
-swerve:Slider("Lane centering speed", 6, 0.5, 3, 6, "", function(v)
+swerve:Slider("Lane centering speed", 5, 0.5, 3, 5, "", function(v)
     State.swerveLaneSpeed = math.min(v, SWERVE_MAX_LATERAL_SPEED)
 end)
 swerve:Slider("Lane centering brake", 36, 2, 18, 36, "", function(v)
@@ -2296,7 +2283,7 @@ end)
 swerve:Slider("Pause after each lane", 0.85, 0.05, 0.25, 2.5, "s", function(v)
     State.laneSwitchPause = v
 end)
-swerve:Slider("Lane transition speed", 6, 0.5, 3, 6, "", function(v)
+swerve:Slider("Lane transition speed", 5, 0.5, 3, 5, "", function(v)
     State.laneTransitionSpeed = math.min(v, SWERVE_MAX_LATERAL_SPEED)
 end)
 swerve:Slider("Lane transition brake", 30, 2, 12, 36, "", function(v)
@@ -2609,7 +2596,7 @@ local existing = getCar()
 if existing then captureCar(existing) end
 
 task.spawn(function()
-    local dt = 1 / 15
+    local dt = 1 / 20
 
     while _G.__CorsaBoostToken == token do
         local seat = currentSeat
@@ -2664,8 +2651,8 @@ task.spawn(function()
                         State.microSwervePhase = "LEFT RAIL RECOVERY"
                         local emergencyX = clamp(
                             (swerveLanes[2] - position.X) * 2.5,
-                            10,
-                            24
+                            8,
+                            14
                         )
                         local saferForward = math.min(State.swerveSpeed, 360)
                         local emergencyZ = velocity.Z + clamp(
