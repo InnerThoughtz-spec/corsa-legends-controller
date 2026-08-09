@@ -159,6 +159,10 @@ local State = {
     retryCount = 0,
     retryArmed = false,
     retryReason = "monitoring",
+    retryState = "monitoring",
+    retryAttempts = 0,
+    retryVisibleFrames = 0,
+    retryPending = false,
     autoPayout = true,
     autoPayoutScore = 2000000,
     payoutCycles = 0,
@@ -170,7 +174,10 @@ local State = {
     fullTuneSelectedType = "none",
 
     antiAfk = true,
-    antiAfkInterval = 55,
+    antiAfkInterval = 19 * 60,
+    antiAfkClicks = 0,
+    antiAfkNextIn = 19 * 60,
+    antiAfkStatus = "waiting",
 }
 
 _G.__CorsaState = State
@@ -216,6 +223,13 @@ local lastRetryClick = 0
 local lastObservedSwerveScore = 0
 local retryArmedUntil = 0
 local retryDetectionSuppressedUntil = 0
+local retrySignalLatchedUntil = 0
+local retryVisibleSince = 0
+local retryVisibleFrames = 0
+local retryPending = false
+local retryRunId = 0
+local swerveControlSuppressedUntil = 0
+local antiAfkNextAt = tick() + State.antiAfkInterval
 local fullTuneOverrides = {}
 local fullTuneOriginals = {}
 local fullTuneNames = {}
@@ -228,10 +242,10 @@ local groundLockToggle
 
 local win = Lib:CreateWindow({
     title = "Corsa Controller",
-    subtitle = "legacy-safe + soft ground rail v23",
+    subtitle = "spawn-safe steering + confirmed Retry v24",
     size = Vector2.new(720, 540),
     menuKey = "p",
-    configName = "corsa-controller-v23",
+    configName = "corsa-controller-v24",
     configFolder = "corsa-controller",
     accentA = Color3.fromRGB(84, 168, 255),
     accentB = Color3.fromRGB(105, 255, 202),
@@ -739,6 +753,9 @@ local function enterSwerveCourse(notifyUser)
     swerveMicroNeedsRecovery = false
     State.microSwervePhase = "center"
     State.microSwerveCount = 0
+    -- A Retry rebuild can leave one frame of stale lateral velocity behind. Keep
+    -- the controller neutral until the replacement seat/root has settled.
+    swerveControlSuppressedUntil = tick() + 1.25
     swerveFaulted = false
     State.serverGhostsRemoved = 0
     resetServerGhosts()
@@ -750,10 +767,15 @@ local function enterSwerveCourse(notifyUser)
 
     swerveCarAddress = car.Address
     retryArmedUntil = 0
-    retryDetectionSuppressedUntil = tick() + 2.5
+    retryDetectionSuppressedUntil = tick() + 4
+    retrySignalLatchedUntil = 0
+    retryVisibleSince = 0
+    retryVisibleFrames = 0
     lastObservedSwerveScore = 0
     State.retryArmed = false
     State.retryReason = "monitoring"
+    State.retryState = retryPending and "finalizing restart" or "monitoring"
+    State.retryVisibleFrames = 0
     if notifyUser then
         Lib:Notify("Swerve", "Autofarm initialized at the car's current position", 3, "success")
     end
@@ -787,6 +809,10 @@ _G.__CorsaStartSwerve = function()
 end
 
 _G.__CorsaStopSwerve = function()
+    retryRunId = retryRunId + 1
+    retryPending = false
+    State.retryPending = false
+    State.retryState = "stopped"
     State.swerveEnabled = false
     swerveMicroOffset = 0
     swerveMicroRecoverUntil = 0
@@ -1491,10 +1517,11 @@ local function clickRetryButton(retry)
 end
 
 local function clickSwerveRetry(force)
-    if not State.autoRetry then return false end
+    if not (force or State.autoRetry) then return false end
     if State.payoutInProgress then return false end
-    if not force and tick() >= retryArmedUntil then return false end
-    if tick() - lastRetryClick < 0.75 then return false end
+    if retryPending then return false end
+    if not force and not State.retryArmed then return false end
+    if tick() - lastRetryClick < 0.90 then return false end
 
     local hesi = getSwerveGui()
     local retry = hesi and hesi:FindFirstChild("Retry")
@@ -1502,25 +1529,126 @@ local function clickSwerveRetry(force)
     if not clickRetryButton(retry) then return false end
 
     lastRetryClick = tick()
-    State.retryCount = State.retryCount + 1
+    retryPending = true
+    retryRunId = retryRunId + 1
+    local thisRetry = retryRunId
+    State.retryPending = true
+    State.retryState = "waiting for Retry screen"
+    State.retryAttempts = 1
+    State.retryArmed = false
+    State.retryReason = "restart pending"
+    retryArmedUntil = 0
     State.enabled = true
-    State.swerveEnabled = true
+    -- Never steer or accelerate a vehicle while Retry is rebuilding it.
+    State.swerveEnabled = false
+    swerveControlSuppressedUntil = tick() + 6
     swerveFaulted = false
 
-    task.delay(0.30, function()
-        if _G.__CorsaBoostToken == token then
-            enterSwerveCourse(false)
+    task.spawn(function()
+        local hiddenSince
+        local secondAttemptAt = tick() + 1.0
+        local screenDeadline = tick() + 5.0
+
+        while _G.__CorsaBoostToken == token
+            and retryRunId == thisRetry
+            and tick() < screenDeadline do
+            local liveHesi = getSwerveGui()
+            local liveRetry = liveHesi and liveHesi:FindFirstChild("Retry")
+            if retryIsOnScreen(liveRetry) then
+                hiddenSince = nil
+                if State.retryAttempts < 2 and tick() >= secondAttemptAt then
+                    if clickRetryButton(liveRetry) then
+                        State.retryAttempts = 2
+                        lastRetryClick = tick()
+                    end
+                end
+            else
+                hiddenSince = hiddenSince or tick()
+                if tick() - hiddenSince >= 0.35 then break end
+            end
+            task.wait(0.12)
+        end
+
+        if _G.__CorsaBoostToken ~= token or retryRunId ~= thisRetry then return end
+
+        if not hiddenSince or tick() - hiddenSince < 0.35 then
+            retryPending = false
+            State.retryPending = false
+            State.retryState = "Retry screen did not close"
+            State.retryReason = "manual Retry needed"
+            retryDetectionSuppressedUntil = tick() + 1
+            Lib:Notify(
+                "Swerve Retry",
+                "Retry stayed open after two spaced clicks; autofarm remains paused",
+                4,
+                "warning"
+            )
+            return
+        end
+
+        State.retryState = "waiting for stable vehicle"
+        task.wait(0.55)
+
+        local restarted = false
+        local settleDeadline = tick() + 4.0
+        while _G.__CorsaBoostToken == token
+            and retryRunId == thisRetry
+            and tick() < settleDeadline do
+            local car = getCar()
+            local seat = car and findSeat(car)
+            local root = car and findVehicleRoot(car)
+            local stable = false
+            if seat and root and playerIsInCar(seat) then
+                local velocity = root.AssemblyLinearVelocity
+                stable = root.Position.Y > -15
+                    and root.CFrame.UpVector.Y > 0.60
+                    and math.abs(velocity.Y) < 8
+            end
+
+            if stable then
+                currentCar = car
+                currentAddress = car.Address
+                currentSeat = seat
+                currentRoot = root
+                State.enabled = true
+                State.swerveEnabled = true
+                swerveControlSuppressedUntil = tick() + 1.25
+                if enterSwerveCourse(false) then
+                    restarted = true
+                    break
+                end
+                State.swerveEnabled = false
+            end
+            task.wait(0.20)
+        end
+
+        retryPending = false
+        State.retryPending = false
+        retryVisibleSince = 0
+        retryVisibleFrames = 0
+        State.retryVisibleFrames = 0
+        retrySignalLatchedUntil = 0
+        retryArmedUntil = 0
+        retryDetectionSuppressedUntil = tick() + 4
+
+        if restarted then
+            State.retryCount = State.retryCount + 1
+            State.retryState = "recovered"
+            State.retryReason = "monitoring"
+            Lib:Notify("Swerve", "Retry confirmed; vehicle settled and farm resumed", 3, "success")
+        else
+            State.swerveEnabled = false
+            State.retryState = "vehicle did not settle"
+            State.retryReason = "respawn/seat required"
+            Lib:Notify(
+                "Swerve Retry",
+                "Retry closed, but no stable occupied vehicle appeared; autofarm remains paused",
+                4,
+                "warning"
+            )
         end
     end)
 
-    -- Some high-score Retry animations briefly swallow the first click.
-    task.delay(0.18, function()
-        if _G.__CorsaBoostToken == token and retryIsOnScreen(retry) then
-            clickRetryButton(retry)
-        end
-    end)
-
-    Lib:Notify("Swerve", "Retry clicked; autofarm resumed", 2, "success")
     return true
 end
 
@@ -1537,7 +1665,13 @@ end
 
 local function updateRetryArm()
     local score = readSwerveScore()
-    if tick() < retryDetectionSuppressedUntil then
+    local now = tick()
+    if retryPending then
+        State.retryArmed = false
+        State.retryReason = "restart pending"
+        return
+    end
+    if now < retryDetectionSuppressedUntil then
         lastObservedSwerveScore = score
         retryArmedUntil = 0
         State.retryArmed = false
@@ -1553,19 +1687,49 @@ local function updateRetryArm()
     end
 
     local hesi = getSwerveGui()
+    local retry = hesi and hesi:FindFirstChild("Retry")
+    local retryVisible = retryIsOnScreen(retry)
     local failed = hesi and hesi:FindFirstChild("Fail")
     local failPulse = failed and failed.Value == true
     local scoreCollapsed = lastObservedSwerveScore >= 5000 and score <= 250
 
     if failPulse or scoreCollapsed then
-        retryArmedUntil = tick() + 2.5
-        State.retryReason = failPulse and "Fail signal" or "score reset detected"
+        retrySignalLatchedUntil = now + 1.5
+    end
+
+    if retryVisible then
+        retryVisibleSince = retryVisibleSince ~= 0 and retryVisibleSince or now
+        retryVisibleFrames = retryVisibleFrames + 1
+    else
+        retryVisibleSince = 0
+        retryVisibleFrames = 0
+    end
+    State.retryVisibleFrames = retryVisibleFrames
+
+    local visibleFor = retryVisibleSince ~= 0 and now - retryVisibleSince or 0
+    local signalConfirmed = now < retrySignalLatchedUntil
+    local retryConfirmed = retryVisibleFrames >= 3
+        and visibleFor >= 0.20
+        and (signalConfirmed or visibleFor >= 0.65)
+
+    if retryConfirmed then
+        retryArmedUntil = now + 2.0
+        if failPulse then
+            State.retryReason = "confirmed Fail signal"
+        elseif scoreCollapsed then
+            State.retryReason = "confirmed score reset"
+        else
+            State.retryReason = "confirmed Retry screen"
+        end
     end
 
     if score > lastObservedSwerveScore then
         lastObservedSwerveScore = score
     end
-    State.retryArmed = tick() < retryArmedUntil
+    State.retryArmed = retryVisible and now < retryArmedUntil
+    if not State.retryArmed and State.retryReason ~= "restart settling" then
+        State.retryReason = "monitoring"
+    end
 end
 
 local function cycleSwervePayout(force)
@@ -2007,6 +2171,12 @@ local swerve = automation:Section("Swerve autofarm", "Left", "safe-lane traffic 
 swerve:Toggle("Autofarm enabled", false, function(on)
     State.swerveEnabled = on
     if on then State.enabled = true end
+    if not on and retryPending then
+        retryRunId = retryRunId + 1
+        retryPending = false
+        State.retryPending = false
+        State.retryState = "stopped"
+    end
     if on and State.swerveAutoEnter then
         if not enterSwerveCourse(true) then
             Lib:Notify("Swerve", "autofarm armed; waiting for the driver seat", 3, "warning")
@@ -2240,7 +2410,9 @@ swerve:Label(function()
     return "Retries recovered: " .. tostring(State.retryCount)
         .. " | " .. (State.retryArmed
             and ("ARMED: " .. tostring(State.retryReason))
-            or "watching score + Fail")
+            or tostring(State.retryState))
+        .. (State.retryPending
+            and (" | click attempt " .. tostring(State.retryAttempts)) or "")
 end)
 swerve:Label(function()
     local remaining = math.max(0, State.autoPayoutScore - readSwerveScore())
@@ -2255,14 +2427,25 @@ swerve:Label(function()
     return "Swerve score: " .. (score and tostring(score.Text) or "0")
 end)
 
-local idle = automation:Section("Anti-AFK", "Right", "small input pulse while idle")
+local idle = automation:Section("Anti-AFK", "Right", "one click every 19 minutes")
 idle:Toggle("Anti-AFK enabled", true, function(on)
     State.antiAfk = on
+    antiAfkNextAt = tick() + State.antiAfkInterval
+    State.antiAfkNextIn = State.antiAfkInterval
+    State.antiAfkStatus = on and "waiting" or "disabled"
 end)
-idle:Slider("Pulse interval", 55, 5, 30, 110, "s", function(v)
-    State.antiAfkInterval = v
+idle:Slider("Click interval", 19, 1, 5, 30, " min", function(v)
+    State.antiAfkInterval = v * 60
+    antiAfkNextAt = tick() + State.antiAfkInterval
+    State.antiAfkNextIn = State.antiAfkInterval
 end)
-idle:Info("Sends a one-pixel mouse pulse at the selected interval. It does not press a driving key.")
+idle:Label(function()
+    local minutes = math.floor((State.antiAfkNextIn or 0) / 60)
+    local seconds = math.floor((State.antiAfkNextIn or 0) % 60)
+    return "Next click: " .. tostring(minutes) .. "m " .. tostring(seconds)
+        .. "s | clicks sent: " .. tostring(State.antiAfkClicks)
+end)
+idle:Info("Sends one normal mouse click every 19 minutes by default. It does not move the pointer or press a driving key.")
 idle:Info("Swerve uses the game's real traffic, ScoreStart, telemetry, and payout flow. Enter the Swerve area normally, then enable the farm.")
 
 local system = win:Tab("System", "settings")
@@ -2369,16 +2552,24 @@ task.spawn(function()
 end)
 
 task.spawn(function()
-    local lastPulse = tick()
-
     while _G.__CorsaBoostToken == token do
-        if State.antiAfk and tick() - lastPulse >= State.antiAfkInterval then
-            pcall(function()
-                mousemoverel(1, 0)
-                task.wait(0.05)
-                mousemoverel(-1, 0)
-            end)
-            lastPulse = tick()
+        local now = tick()
+        if State.antiAfk then
+            State.antiAfkNextIn = math.max(0, antiAfkNextAt - now)
+            if now >= antiAfkNextAt then
+                local ok = pcall(function() mouse1click() end)
+                if ok then
+                    State.antiAfkClicks = State.antiAfkClicks + 1
+                    State.antiAfkStatus = "clicked"
+                else
+                    State.antiAfkStatus = "click unavailable"
+                end
+                antiAfkNextAt = tick() + State.antiAfkInterval
+                State.antiAfkNextIn = State.antiAfkInterval
+            end
+        else
+            antiAfkNextAt = now + State.antiAfkInterval
+            State.antiAfkNextIn = State.antiAfkInterval
         end
         task.wait(1)
     end
@@ -2410,7 +2601,14 @@ task.spawn(function()
                 local output = velocity
                 local changed = false
 
-                if State.swerveEnabled then
+                if retryPending then
+                    output = Vector3.new(
+                        0,
+                        clamp(velocity.Y, -3, State.maxRise),
+                        velocity.Z
+                    )
+                    changed = true
+                elseif State.swerveEnabled then
                     local position = root.Position
                     if position.Y < -15 then
                         State.swerveEnabled = false
@@ -2423,6 +2621,17 @@ task.spawn(function()
                                 "error"
                             )
                         end
+                    elseif tick() < swerveControlSuppressedUntil then
+                        -- During spawn/Retry settling, discard inherited lateral
+                        -- motion and leave lane selection untouched. This is the
+                        -- guard that prevents the instant launch toward lane 1.
+                        output = Vector3.new(
+                            0,
+                            clamp(velocity.Y, -3, State.maxRise),
+                            velocity.Z
+                        )
+                        State.microSwervePhase = "spawn settling"
+                        changed = true
                     else
                         output = State.groundTrackLock
                             and buildExperimentalSwerveVelocity(root, velocity, dt)
@@ -2446,7 +2655,7 @@ task.spawn(function()
                     changed = true
                 end
 
-                local boosting = not State.swerveEnabled
+                local boosting = not retryPending and not State.swerveEnabled
                     and State.nitroEnabled and State.nitroHeld
                 if boosting and forwardSpeed < State.maxSpeed then
                     local push = math.min(
