@@ -161,7 +161,7 @@ local State = {
     retryReason = "monitoring",
     retryState = "monitoring",
     retryAttempts = 0,
-    retryVisibleFrames = 0,
+    retrySignalFrames = 0,
     retryPending = false,
     autoPayout = true,
     autoPayoutScore = 2000000,
@@ -224,8 +224,7 @@ local lastObservedSwerveScore = 0
 local retryArmedUntil = 0
 local retryDetectionSuppressedUntil = 0
 local retrySignalLatchedUntil = 0
-local retryVisibleSince = 0
-local retryVisibleFrames = 0
+local retrySignalFrames = 0
 local retryPending = false
 local retryRunId = 0
 local swerveControlSuppressedUntil = 0
@@ -242,10 +241,10 @@ local groundLockToggle
 
 local win = Lib:CreateWindow({
     title = "Corsa Controller",
-    subtitle = "spawn-safe steering + confirmed Retry v24",
+    subtitle = "spawn-safe steering + signal-confirmed Retry v25",
     size = Vector2.new(720, 540),
     menuKey = "p",
-    configName = "corsa-controller-v24",
+    configName = "corsa-controller-v25",
     configFolder = "corsa-controller",
     accentA = Color3.fromRGB(84, 168, 255),
     accentB = Color3.fromRGB(105, 255, 202),
@@ -769,13 +768,12 @@ local function enterSwerveCourse(notifyUser)
     retryArmedUntil = 0
     retryDetectionSuppressedUntil = tick() + 4
     retrySignalLatchedUntil = 0
-    retryVisibleSince = 0
-    retryVisibleFrames = 0
+    retrySignalFrames = 0
     lastObservedSwerveScore = 0
     State.retryArmed = false
     State.retryReason = "monitoring"
     State.retryState = retryPending and "finalizing restart" or "monitoring"
-    State.retryVisibleFrames = 0
+    State.retrySignalFrames = 0
     if notifyUser then
         Lib:Notify("Swerve", "Autofarm initialized at the car's current position", 3, "success")
     end
@@ -1533,7 +1531,7 @@ local function clickSwerveRetry(force)
     retryRunId = retryRunId + 1
     local thisRetry = retryRunId
     State.retryPending = true
-    State.retryState = "waiting for Retry screen"
+    State.retryState = "Retry click sent"
     State.retryAttempts = 1
     State.retryArmed = false
     State.retryReason = "restart pending"
@@ -1545,51 +1543,28 @@ local function clickSwerveRetry(force)
     swerveFaulted = false
 
     task.spawn(function()
-        local hiddenSince
-        local secondAttemptAt = tick() + 1.0
-        local screenDeadline = tick() + 5.0
+        -- Matcha cannot read GuiObject.Visible. Completion is therefore based on
+        -- the supported Fail BoolValue plus a stable occupied replacement root,
+        -- never on the Retry button retaining an on-screen rectangle.
+        task.wait(0.85)
+        if _G.__CorsaBoostToken ~= token or retryRunId ~= thisRetry then return end
 
-        while _G.__CorsaBoostToken == token
-            and retryRunId == thisRetry
-            and tick() < screenDeadline do
-            local liveHesi = getSwerveGui()
-            local liveRetry = liveHesi and liveHesi:FindFirstChild("Retry")
-            if retryIsOnScreen(liveRetry) then
-                hiddenSince = nil
-                if State.retryAttempts < 2 and tick() >= secondAttemptAt then
-                    if clickRetryButton(liveRetry) then
-                        State.retryAttempts = 2
-                        lastRetryClick = tick()
-                    end
-                end
-            else
-                hiddenSince = hiddenSince or tick()
-                if tick() - hiddenSince >= 0.35 then break end
+        local liveHesi = getSwerveGui()
+        local failed = liveHesi and liveHesi:FindFirstChild("Fail")
+        if failed and failed.Value == true then
+            local liveRetry = liveHesi:FindFirstChild("Retry")
+            if liveRetry and clickRetryButton(liveRetry) then
+                State.retryAttempts = 2
+                lastRetryClick = tick()
+                task.wait(0.85)
             end
-            task.wait(0.12)
         end
 
         if _G.__CorsaBoostToken ~= token or retryRunId ~= thisRetry then return end
-
-        if not hiddenSince or tick() - hiddenSince < 0.35 then
-            retryPending = false
-            State.retryPending = false
-            State.retryState = "Retry screen did not close"
-            State.retryReason = "manual Retry needed"
-            retryDetectionSuppressedUntil = tick() + 1
-            Lib:Notify(
-                "Swerve Retry",
-                "Retry stayed open after two spaced clicks; autofarm remains paused",
-                4,
-                "warning"
-            )
-            return
-        end
-
         State.retryState = "waiting for stable vehicle"
-        task.wait(0.55)
 
         local restarted = false
+        local stableFrames = 0
         local settleDeadline = tick() + 4.0
         while _G.__CorsaBoostToken == token
             and retryRunId == thisRetry
@@ -1600,33 +1575,41 @@ local function clickSwerveRetry(force)
             local stable = false
             if seat and root and playerIsInCar(seat) then
                 local velocity = root.AssemblyLinearVelocity
+                local currentHesi = getSwerveGui()
+                local currentFail = currentHesi and currentHesi:FindFirstChild("Fail")
+                local failActive = currentFail and currentFail.Value == true
                 stable = root.Position.Y > -15
                     and root.CFrame.UpVector.Y > 0.60
                     and math.abs(velocity.Y) < 8
+                    and not failActive
             end
 
             if stable then
-                currentCar = car
-                currentAddress = car.Address
-                currentSeat = seat
-                currentRoot = root
-                State.enabled = true
-                State.swerveEnabled = true
-                swerveControlSuppressedUntil = tick() + 1.25
-                if enterSwerveCourse(false) then
-                    restarted = true
-                    break
+                stableFrames = stableFrames + 1
+                if stableFrames >= 3 then
+                    currentCar = car
+                    currentAddress = car.Address
+                    currentSeat = seat
+                    currentRoot = root
+                    State.enabled = true
+                    State.swerveEnabled = true
+                    swerveControlSuppressedUntil = tick() + 1.25
+                    if enterSwerveCourse(false) then
+                        restarted = true
+                        break
+                    end
+                    State.swerveEnabled = false
                 end
-                State.swerveEnabled = false
+            else
+                stableFrames = 0
             end
-            task.wait(0.20)
+            task.wait(0.15)
         end
 
         retryPending = false
         State.retryPending = false
-        retryVisibleSince = 0
-        retryVisibleFrames = 0
-        State.retryVisibleFrames = 0
+        retrySignalFrames = 0
+        State.retrySignalFrames = 0
         retrySignalLatchedUntil = 0
         retryArmedUntil = 0
         retryDetectionSuppressedUntil = tick() + 4
@@ -1687,8 +1670,6 @@ local function updateRetryArm()
     end
 
     local hesi = getSwerveGui()
-    local retry = hesi and hesi:FindFirstChild("Retry")
-    local retryVisible = retryIsOnScreen(retry)
     local failed = hesi and hesi:FindFirstChild("Fail")
     local failPulse = failed and failed.Value == true
     local scoreCollapsed = lastObservedSwerveScore >= 5000 and score <= 250
@@ -1697,20 +1678,14 @@ local function updateRetryArm()
         retrySignalLatchedUntil = now + 1.5
     end
 
-    if retryVisible then
-        retryVisibleSince = retryVisibleSince ~= 0 and retryVisibleSince or now
-        retryVisibleFrames = retryVisibleFrames + 1
-    else
-        retryVisibleSince = 0
-        retryVisibleFrames = 0
-    end
-    State.retryVisibleFrames = retryVisibleFrames
-
-    local visibleFor = retryVisibleSince ~= 0 and now - retryVisibleSince or 0
     local signalConfirmed = now < retrySignalLatchedUntil
-    local retryConfirmed = retryVisibleFrames >= 3
-        and visibleFor >= 0.20
-        and (signalConfirmed or visibleFor >= 0.65)
+    if signalConfirmed then
+        retrySignalFrames = retrySignalFrames + 1
+    else
+        retrySignalFrames = 0
+    end
+    State.retrySignalFrames = retrySignalFrames
+    local retryConfirmed = signalConfirmed and retrySignalFrames >= 3
 
     if retryConfirmed then
         retryArmedUntil = now + 2.0
@@ -1719,14 +1694,14 @@ local function updateRetryArm()
         elseif scoreCollapsed then
             State.retryReason = "confirmed score reset"
         else
-            State.retryReason = "confirmed Retry screen"
+            State.retryReason = "confirmed game failure"
         end
     end
 
     if score > lastObservedSwerveScore then
         lastObservedSwerveScore = score
     end
-    State.retryArmed = retryVisible and now < retryArmedUntil
+    State.retryArmed = signalConfirmed and now < retryArmedUntil
     if not State.retryArmed and State.retryReason ~= "restart settling" then
         State.retryReason = "monitoring"
     end
