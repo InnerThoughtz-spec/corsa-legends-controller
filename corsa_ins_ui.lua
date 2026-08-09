@@ -154,7 +154,7 @@ local State = {
     crashGuardDistance = 120,
     crashGuardSpeed = 0,
     serverGhostProtection = true,
-    serverGhostCutoff = 100,
+    serverGhostCutoff = 350,
     serverGhostsRemoved = 0,
     serverGhostResets = 0,
     autoRetry = true,
@@ -221,6 +221,7 @@ local detachedTrafficProxyAddresses = {}
 local removedServerGhostIds = {}
 local lastCharacterSpeed
 local lastCrashGuardWrite = 0
+local lastServerGhostPrune = 0
 local lastRetryClick = 0
 local lastObservedSwerveScore = 0
 local retryArmedUntil = 0
@@ -244,10 +245,10 @@ local groundLockToggle
 
 local win = Lib:CreateWindow({
     title = "Corsa Controller",
-    subtitle = "axis-separated lane control + verified Retry v27",
+    subtitle = "full-corridor ghost cleanup + stable lanes v28",
     size = Vector2.new(720, 540),
     menuKey = "p",
-    configName = "corsa-controller-v27",
+    configName = "corsa-controller-v28",
     configFolder = "corsa-controller",
     accentA = Color3.fromRGB(84, 168, 255),
     accentB = Color3.fromRGB(105, 255, 202),
@@ -1334,16 +1335,29 @@ local function removeImminentServerGhosts()
     local ghostDespawn = getSwerveRemote("GhostDespawn")
     if not ghostDespawn then return end
 
+    local now = tick()
+    if now - lastServerGhostPrune >= 30 then
+        lastServerGhostPrune = now
+        for ghostId, removedAt in pairs(removedServerGhostIds) do
+            if now - removedAt > 180 then
+                removedServerGhostIds[ghostId] = nil
+            end
+        end
+    end
+
     local position = root.Position
+    local corridorLeft = swerveLanes[1] - 10
+    local corridorRight = swerveLanes[3] + 10
     for i = 1, #collisionModels do
         local car = collisionModels[i]
         local part = car and car.PrimaryPart
         if part then
             local ahead = part.Position.Z - position.Z
-            local lateral = math.abs(part.Position.X - position.X)
-            if ahead > -25
+            local insideCourse = part.Position.X >= corridorLeft
+                and part.Position.X <= corridorRight
+            if ahead > -50
                 and ahead <= State.serverGhostCutoff
-                and lateral < 14 then
+                and insideCourse then
                 local ghostId = car:GetAttribute("GhostId")
                 local key = ghostId and tostring(ghostId)
                 if key and not removedServerGhostIds[key] then
@@ -2328,7 +2342,7 @@ swerve:Toggle("Server crash-hitbox guard", true, function(on)
     State.serverGhostProtection = on
     if on and State.swerveEnabled then resetServerGhosts() end
 end)
-swerve:Slider("Server ghost cutoff", 100, 5, 60, 160, " studs", function(v)
+swerve:Slider("Server ghost cutoff", 350, 10, 100, 500, " studs", function(v)
     State.serverGhostCutoff = v
 end)
 swerve:Button("Click Retry now", function()
