@@ -130,6 +130,14 @@ local State = {
     groundTrackLock = false,
     groundTrackHeight = 0,
     groundTrackCorrections = 0,
+    groundTrackStrength = 2.4,
+    groundTrackDamping = 0.85,
+    groundTrackMaxVerticalSpeed = 2.5,
+    groundTrackVerticalAcceleration = 12,
+    groundTrackHeightError = 0,
+    groundTrackVerticalSpeed = 0,
+    groundTrackFallbacks = 0,
+    groundTrackStatus = "legacy",
     avoidLeftRail = true,
     targetLane = 2,
     trafficNoCollision = true,
@@ -216,13 +224,14 @@ local fullTuneSelected
 local fullTunePendingValue = ""
 local fullTuneDropdown
 local fullTuneValueBox
+local groundLockToggle
 
 local win = Lib:CreateWindow({
     title = "Corsa Controller",
-    subtitle = "legacy-safe + experimental rail v22",
+    subtitle = "legacy-safe + soft ground rail v23",
     size = Vector2.new(720, 540),
     menuKey = "p",
-    configName = "corsa-controller-v22",
+    configName = "corsa-controller-v23",
     configFolder = "corsa-controller",
     accentA = Color3.fromRGB(84, 168, 255),
     accentB = Color3.fromRGB(105, 255, 202),
@@ -715,6 +724,10 @@ local function enterSwerveCourse(notifyUser)
     swerveGroundY = root.Position.Y
     State.groundTrackHeight = swerveGroundY
     State.groundTrackCorrections = 0
+    State.groundTrackHeightError = 0
+    State.groundTrackVerticalSpeed = root.AssemblyLinearVelocity.Y
+    State.groundTrackStatus = State.groundTrackLock
+        and "soft velocity lock armed" or "legacy"
     swerveLaneSwitching = false
     State.laneSwitching = false
     swerveNextLaneSwitchAt = tick() + State.laneSwitchPause
@@ -759,15 +772,6 @@ local function stabilizeSwerveCar(root)
     swerveNextLaneSwitchAt = tick() + State.laneSwitchPause
     pcall(function()
         local velocity = root.AssemblyLinearVelocity
-        if State.groundTrackLock then
-            local position = root.Position
-            local lockedX = math.max(position.X, swerveLeftBoundaryX)
-            root.CFrame = CFrame.lookAt(
-                Vector3.new(lockedX, swerveGroundY, position.Z),
-                Vector3.new(lockedX, swerveGroundY, position.Z) + swerveForward,
-                Vector3.new(0, 1, 0)
-            )
-        end
         root.AssemblyLinearVelocity = Vector3.new(
             0,
             State.groundTrackLock and 0 or clamp(velocity.Y, -4, State.maxRise),
@@ -891,39 +895,84 @@ local function updateTwoLaneTarget(positionX)
     State.targetLane = swerveLane
 end
 
-local function enforceSwerveTrackLock(root)
-    if not (State.groundTrackLock and root) then return false end
+local lastGroundTrackFallback = 0
 
+local function disableExperimentalGroundLock(reason)
+    if not State.groundTrackLock then return end
+    State.groundTrackLock = false
+    State.groundTrackFallbacks = State.groundTrackFallbacks + 1
+    State.groundTrackStatus = "fallback: " .. tostring(reason)
+    swerveLaneSwitching = false
+    State.laneSwitching = false
+    swerveMicroOffset = 0
+    swerveMicroRecoverUntil = 0
+    swerveMicroNeedsRecovery = false
+    swerveMicroNextAt = tick() + State.microSwervePause
+
+    if groundLockToggle then
+        pcall(function() groundLockToggle:Set(false) end)
+    end
+    if tick() - lastGroundTrackFallback > 2 then
+        lastGroundTrackFallback = tick()
+        Lib:Notify(
+            "Ground lock fallback",
+            tostring(reason) .. "; legacy controller restored",
+            4,
+            "warning"
+        )
+    end
+end
+
+local function softGroundVerticalVelocity(root, velocity, dt)
     local position = root.Position
     if not swerveGroundY then
         swerveGroundY = position.Y
         State.groundTrackHeight = swerveGroundY
     end
 
-    local look = root.CFrame.LookVector
-    local up = root.CFrame.UpVector
-    local lockedX = math.max(position.X, swerveLeftBoundaryX)
-    local heightError = math.abs(position.Y - swerveGroundY)
-    -- Experimental mode only performs an orientation write after a material
-    -- deviation. Tiny suspension movement must not fight the welded assembly.
-    local notStraight = math.abs(look.X) > 0.20
-        or math.abs(look.Y) > 0.16
-        or look.Z < 0.96
-        or up.Y < 0.94
-    local crossedBoundary = position.X < swerveLeftBoundaryX
+    local heightError = swerveGroundY - position.Y
+    local verticalSpeed = velocity.Y
+    local upY = root.CFrame.UpVector.Y
+    State.groundTrackHeightError = heightError
+    State.groundTrackVerticalSpeed = verticalSpeed
 
-    if not (heightError > 0.65 or notStraight or crossedBoundary) then
-        return false
+    if math.abs(heightError) > 4 then
+        disableExperimentalGroundLock("unsafe road-height difference")
+        return clamp(verticalSpeed, -3, 3), false
+    end
+    if math.abs(verticalSpeed) > 8 then
+        disableExperimentalGroundLock("unsafe vertical speed")
+        return clamp(verticalSpeed, -3, 3), false
+    end
+    if upY < 0.55 then
+        disableExperimentalGroundLock("vehicle tilt exceeded safe limit")
+        return clamp(verticalSpeed, -3, 3), false
     end
 
-    local lockedPosition = Vector3.new(lockedX, swerveGroundY, position.Z)
-    root.CFrame = CFrame.lookAt(
-        lockedPosition,
-        lockedPosition + swerveForward,
-        Vector3.new(0, 1, 0)
+    local desired = heightError * State.groundTrackStrength
+        - verticalSpeed * State.groundTrackDamping
+    desired = clamp(
+        desired,
+        -State.groundTrackMaxVerticalSpeed,
+        State.groundTrackMaxVerticalSpeed
     )
-    State.groundTrackCorrections = State.groundTrackCorrections + 1
-    return true
+    local maxStep = State.groundTrackVerticalAcceleration * dt
+    local result = verticalSpeed + clamp(
+        desired - verticalSpeed,
+        -maxStep,
+        maxStep
+    )
+    result = clamp(
+        result,
+        -State.groundTrackMaxVerticalSpeed,
+        State.groundTrackMaxVerticalSpeed
+    )
+
+    if math.abs(result - verticalSpeed) > 0.05 then
+        State.groundTrackCorrections = State.groundTrackCorrections + 1
+    end
+    State.groundTrackStatus = "soft velocity lock"
+    return result, true
 end
 
 local function buildLegacySwerveVelocity(velocity, position, dt)
@@ -999,8 +1048,11 @@ local function buildLegacySwerveVelocity(velocity, position, dt)
 end
 
 local function buildExperimentalSwerveVelocity(root, velocity, dt)
-    enforceSwerveTrackLock(root)
     local position = root.Position
+    local newY, safe = softGroundVerticalVelocity(root, velocity, dt)
+    if not safe then
+        return buildLegacySwerveVelocity(velocity, position, dt)
+    end
     updateTwoLaneTarget(position.X)
 
     local laneGap = math.min(
@@ -1049,7 +1101,7 @@ local function buildExperimentalSwerveVelocity(root, velocity, dt)
         -State.swerveAcceleration * dt,
         State.swerveAcceleration * dt
     )
-    local output = Vector3.new(newX, 0, newZ)
+    local output = Vector3.new(newX, newY, newZ)
     local horizontalDelta = Vector3.new(
         output.X - velocity.X,
         0,
@@ -1059,7 +1111,7 @@ local function buildExperimentalSwerveVelocity(root, velocity, dt)
         local limited = horizontalDelta.Unit * 7.5
         output = Vector3.new(
             velocity.X + limited.X,
-            0,
+            newY,
             velocity.Z + limited.Z
         )
     end
@@ -1994,7 +2046,26 @@ end)
 swerve:Info("The legacy controller changes velocity only. It is the default fallback and never writes the vehicle body's CFrame.")
 
 swerve:Divider("Experimental ground rail")
-swerve:Toggle("Use experimental ground lock", false, function(on)
+groundLockToggle = swerve:Toggle("Use experimental soft lock", false, function(on)
+    if on and currentRoot then
+        local upY = currentRoot.CFrame.UpVector.Y
+        local verticalSpeed = currentRoot.AssemblyLinearVelocity.Y
+        if upY < 0.75 or math.abs(verticalSpeed) > 5 then
+            State.groundTrackLock = false
+            State.groundTrackStatus = "enable rejected: reset vehicle first"
+            Lib:Notify(
+                "Ground lock",
+                "Vehicle is tilted or airborne; Retry/respawn before enabling",
+                4,
+                "error"
+            )
+            if groundLockToggle then
+                pcall(function() groundLockToggle:Set(false) end)
+            end
+            return
+        end
+    end
+
     State.groundTrackLock = on
     swerveLane = math.max(2, math.min(3, swerveLane))
     swerveLaneSwitching = false
@@ -2007,7 +2078,11 @@ swerve:Toggle("Use experimental ground lock", false, function(on)
         swerveGroundY = currentRoot.Position.Y
         State.groundTrackHeight = swerveGroundY
         State.groundTrackCorrections = 0
+        State.groundTrackHeightError = 0
+        State.groundTrackVerticalSpeed = currentRoot.AssemblyLinearVelocity.Y
+        State.groundTrackStatus = "soft velocity lock armed"
     else
+        State.groundTrackStatus = "legacy"
         State.microSwervePhase = "legacy centered"
         swerveMicroNextAt = tick() + State.microSwervePause
     end
@@ -2034,7 +2109,16 @@ end)
 swerve:Slider("Lane transition brake", 30, 2, 12, 36, "", function(v)
     State.laneTransitionAcceleration = math.min(v, SWERVE_MAX_LATERAL_ACCELERATION)
 end)
-swerve:Info("Experimental mode locks out lane 1 and alternates only between the middle and right lanes. Leave its toggle off to use the old stable controller while this mode is refined.")
+swerve:Slider("Height lock strength", 2.4, 0.1, 0.5, 4, "", function(v)
+    State.groundTrackStrength = v
+end)
+swerve:Slider("Vertical damping", 0.85, 0.05, 0.2, 1.5, "", function(v)
+    State.groundTrackDamping = v
+end)
+swerve:Slider("Maximum vertical speed", 2.5, 0.25, 1, 5, "", function(v)
+    State.groundTrackMaxVerticalSpeed = v
+end)
+swerve:Info("Soft-lock mode never writes CFrame or position. It uses bounded vertical velocity, locks out lane 1, alternates middle/right, and automatically falls back to legacy if the car tilts, clips, or gains unsafe vertical speed.")
 swerve:Button("Initialize from current position", function()
     _G.__CorsaStartSwerve()
 end)
@@ -2108,10 +2192,15 @@ swerve:Label(function()
 end)
 swerve:Label(function()
     if not State.groundTrackLock then
-        return "Controller: legacy stable velocity method"
+        return "Controller: legacy stable | soft lock: "
+            .. tostring(State.groundTrackStatus)
+            .. " | fallbacks: " .. tostring(State.groundTrackFallbacks)
     end
-    return "Controller: EXPERIMENTAL ground rail"
-        .. " | height: " .. tostring(math.floor(State.groundTrackHeight * 100 + 0.5) / 100)
+    return "Controller: EXPERIMENTAL soft rail"
+        .. " | Y error: "
+        .. tostring(math.floor(State.groundTrackHeightError * 100 + 0.5) / 100)
+        .. " | Y speed: "
+        .. tostring(math.floor(State.groundTrackVerticalSpeed * 100 + 0.5) / 100)
         .. " | corrections: " .. tostring(State.groundTrackCorrections)
 end)
 swerve:Label(function()
