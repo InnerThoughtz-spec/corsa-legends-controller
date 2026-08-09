@@ -8,4 +8,4 @@ INS-ui speed, grip, suspension, high-speed stability, and Swerve automation cont
 loadstring(game:HttpGet("https://raw.githubusercontent.com/InnerThoughtz-spec/corsa-legends-controller/main/corsa_ins_ui.lua"))()
 ```
 
-Version 28 adds full-corridor `GhostDespawn` cleanup 350 studs ahead, axis-separated lane correction, a hard left-rail recovery boundary, motion-confirmed Retry recovery, and click-only Anti-AFK at a 19-minute default interval.
+Version 29 disables collision on every generated `SideTrash` mesh and proxy beside the guardrails, including newly spawned road sections. It also includes full-corridor ghost cleanup, stable lane control, verified Retry recovery, and click-only Anti-AFK.

@@ -13,6 +13,9 @@ end
 if _G.__CorsaRestoreTrafficProxies then
     pcall(_G.__CorsaRestoreTrafficProxies)
 end
+if _G.__CorsaRestoreRoadTrash then
+    pcall(_G.__CorsaRestoreRoadTrash)
+end
 
 if _G.__CorsaUI then
     pcall(function() _G.__CorsaUI:Destroy() end)
@@ -149,6 +152,11 @@ local State = {
     trafficModels = 0,
     trafficCollidable = 0,
     trafficProxiesDetached = 0,
+    roadTrashNoCollision = true,
+    roadTrashModels = 0,
+    roadTrashParts = 0,
+    roadTrashCollidable = 0,
+    roadTrashChanges = 0,
     crashGuard = true,
     crashGuardActive = false,
     crashGuardDistance = 120,
@@ -215,6 +223,8 @@ local collisionParts = {}
 local collisionPartAddresses = {}
 local collisionModels = {}
 local collisionModelAddresses = {}
+local roadTrashParts = {}
+local roadTrashOriginalCollide = {}
 local playerWheelParts = {}
 local detachedTrafficProxies = {}
 local detachedTrafficProxyAddresses = {}
@@ -245,10 +255,10 @@ local groundLockToggle
 
 local win = Lib:CreateWindow({
     title = "Corsa Controller",
-    subtitle = "full-corridor ghost cleanup + stable lanes v28",
+    subtitle = "roadside-trash ghosting + stable lanes v29",
     size = Vector2.new(720, 540),
     menuKey = "p",
-    configName = "corsa-controller-v28",
+    configName = "corsa-controller-v29",
     configFolder = "corsa-controller",
     accentA = Color3.fromRGB(84, 168, 255),
     accentB = Color3.fromRGB(105, 255, 202),
@@ -1191,6 +1201,94 @@ local function isTrafficPart(part)
     return className == "Part"
         or className == "MeshPart"
         or className == "UnionOperation"
+end
+
+local function restoreRoadTrashCollisions()
+    for _, entry in pairs(roadTrashOriginalCollide) do
+        if entry and entry.part then
+            pcall(function()
+                entry.part.CanCollide = entry.canCollide
+            end)
+        end
+    end
+    roadTrashParts = {}
+    roadTrashOriginalCollide = {}
+    State.roadTrashModels = 0
+    State.roadTrashParts = 0
+    State.roadTrashCollidable = 0
+end
+
+_G.__CorsaRestoreRoadTrash = restoreRoadTrashCollisions
+
+local function discoverRoadTrash()
+    if not State.roadTrashNoCollision then return end
+
+    local traffic = game.Workspace:FindFirstChild("AITraffic")
+    local generated = traffic and traffic:FindFirstChild("GenRoad")
+    if not generated then
+        roadTrashParts = {}
+        State.roadTrashModels = 0
+        State.roadTrashParts = 0
+        return
+    end
+
+    local fresh = {}
+    local seen = {}
+    local models = 0
+    for _, road in ipairs(generated:GetChildren()) do
+        local trash = road:FindFirstChild("SideTrash")
+        if trash then
+            models = models + 1
+            for _, part in ipairs(trash:GetDescendants()) do
+                if isTrafficPart(part) then
+                    fresh[#fresh + 1] = part
+                    local address = part.Address
+                    if address then
+                        seen[address] = true
+                        local original = roadTrashOriginalCollide[address]
+                        if original then
+                            original.part = part
+                        else
+                            roadTrashOriginalCollide[address] = {
+                                part = part,
+                                canCollide = part.CanCollide == true,
+                            }
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    for address in pairs(roadTrashOriginalCollide) do
+        if not seen[address] then
+            roadTrashOriginalCollide[address] = nil
+        end
+    end
+    roadTrashParts = fresh
+    State.roadTrashModels = models
+    State.roadTrashParts = #fresh
+end
+
+local function enforceRoadTrashGhosting()
+    if not State.roadTrashNoCollision then return end
+
+    local changed = 0
+    local remaining = 0
+    for i = 1, #roadTrashParts do
+        local part = roadTrashParts[i]
+        if part then
+            pcall(function()
+                if part.CanCollide then
+                    part.CanCollide = false
+                    changed = changed + 1
+                end
+                if part.CanCollide then remaining = remaining + 1 end
+            end)
+        end
+    end
+    State.roadTrashChanges = State.roadTrashChanges + changed
+    State.roadTrashCollidable = remaining
 end
 
 local function cacheTrafficModel(car)
@@ -2342,6 +2440,15 @@ swerve:Toggle("Server crash-hitbox guard", true, function(on)
     State.serverGhostProtection = on
     if on and State.swerveEnabled then resetServerGhosts() end
 end)
+swerve:Toggle("Ghost roadside trash piles", true, function(on)
+    State.roadTrashNoCollision = on
+    if on then
+        discoverRoadTrash()
+        enforceRoadTrashGhosting()
+    else
+        restoreRoadTrashCollisions()
+    end
+end)
 swerve:Slider("Server ghost cutoff", 350, 10, 100, 500, " studs", function(v)
     State.serverGhostCutoff = v
 end)
@@ -2418,6 +2525,12 @@ end)
 swerve:Label(function()
     return "AI hitboxes removed: " .. tostring(State.trafficProxiesDetached)
         .. " | player wheels: always solid"
+end)
+swerve:Label(function()
+    return "Roadside trash: " .. tostring(State.roadTrashModels)
+        .. " piles | " .. tostring(State.roadTrashParts)
+        .. " parts | " .. tostring(State.roadTrashCollidable)
+        .. " collidable remaining"
 end)
 swerve:Label(function()
     local speed = math.floor((State.crashGuardSpeed or 0) * 10 + 0.5) / 10
@@ -2497,6 +2610,9 @@ actions:Button("Stop controller", function()
     if _G.__CorsaRestoreTrafficProxies then
         pcall(_G.__CorsaRestoreTrafficProxies)
     end
+    if _G.__CorsaRestoreRoadTrash then
+        pcall(_G.__CorsaRestoreRoadTrash)
+    end
     Lib:Notify("Corsa", "controller stopped", 2, "warning")
 end):SetRisk()
 
@@ -2533,6 +2649,14 @@ end)
 
 task.spawn(function()
     while _G.__CorsaBoostToken == token do
+        discoverRoadTrash()
+        enforceRoadTrashGhosting()
+        task.wait(0.10)
+    end
+end)
+
+task.spawn(function()
+    while _G.__CorsaBoostToken == token do
         if State.autoPayout then cycleSwervePayout(false) end
         updateRetryArm()
         if State.autoRetry then clickSwerveRetry(false) end
@@ -2548,11 +2672,13 @@ collisionStepped = runService.Stepped:Connect(function()
     if _G.__CorsaBoostToken ~= token then
         restorePlayerWheels()
         restoreTrafficProxies()
+        restoreRoadTrashCollisions()
         collisionStepped:Disconnect()
         return
     end
 
     enforceTrafficGhosting()
+    enforceRoadTrashGhosting()
     removeImminentServerGhosts()
     enforceCrashGuard()
 end)
@@ -2560,6 +2686,7 @@ end)
 collisionHeartbeat = runService.Heartbeat:Connect(function()
     if _G.__CorsaBoostToken ~= token then
         restorePlayerWheels()
+        restoreRoadTrashCollisions()
         collisionHeartbeat:Disconnect()
         return
     end
@@ -2567,6 +2694,7 @@ collisionHeartbeat = runService.Heartbeat:Connect(function()
     -- The second pass catches anything the game's speed-based traffic toggle
     -- changed during the frame. The Stepped pass is the one that protects physics.
     enforceTrafficGhosting()
+    enforceRoadTrashGhosting()
     updateCharacterSpeedReference()
 end)
 
