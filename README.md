@@ -8,4 +8,4 @@ INS-ui speed, grip, suspension, high-speed stability, and Swerve automation cont
 loadstring(game:HttpGet("https://raw.githubusercontent.com/InnerThoughtz-spec/corsa-legends-controller/main/corsa_ins_ui.lua"))()
 ```
 
-Version 29 disables collision on every generated `SideTrash` mesh and proxy beside the guardrails, including newly spawned road sections. It also includes full-corridor ghost cleanup, stable lane control, verified Retry recovery, and click-only Anti-AFK.
+Version 30 restores score-producing traffic passes by despawning only an imminent car in the player's current lane. Adjacent traffic stays alive for near-miss scoring, while generated `SideTrash` meshes and proxies remain non-collidable. It also includes stable lane control, verified Retry recovery, and click-only Anti-AFK.

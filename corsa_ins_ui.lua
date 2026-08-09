@@ -162,7 +162,7 @@ local State = {
     crashGuardDistance = 120,
     crashGuardSpeed = 0,
     serverGhostProtection = true,
-    serverGhostCutoff = 350,
+    serverGhostCutoff = 100,
     serverGhostsRemoved = 0,
     serverGhostResets = 0,
     autoRetry = true,
@@ -255,10 +255,10 @@ local groundLockToggle
 
 local win = Lib:CreateWindow({
     title = "Corsa Controller",
-    subtitle = "roadside-trash ghosting + stable lanes v29",
+    subtitle = "score-safe traffic guard + roadside ghosting v30",
     size = Vector2.new(720, 540),
     menuKey = "p",
-    configName = "corsa-controller-v29",
+    configName = "corsa-controller-v30",
     configFolder = "corsa-controller",
     accentA = Color3.fromRGB(84, 168, 255),
     accentB = Color3.fromRGB(105, 255, 202),
@@ -1444,18 +1444,15 @@ local function removeImminentServerGhosts()
     end
 
     local position = root.Position
-    local corridorLeft = swerveLanes[1] - 10
-    local corridorRight = swerveLanes[3] + 10
     for i = 1, #collisionModels do
         local car = collisionModels[i]
         local part = car and car.PrimaryPart
         if part then
             local ahead = part.Position.Z - position.Z
-            local insideCourse = part.Position.X >= corridorLeft
-                and part.Position.X <= corridorRight
-            if ahead > -50
+            local lateral = math.abs(part.Position.X - position.X)
+            if ahead > -25
                 and ahead <= State.serverGhostCutoff
-                and insideCourse then
+                and lateral < 14 then
                 local ghostId = car:GetAttribute("GhostId")
                 local key = ghostId and tostring(ghostId)
                 if key and not removedServerGhostIds[key] then
@@ -2449,7 +2446,7 @@ swerve:Toggle("Ghost roadside trash piles", true, function(on)
         restoreRoadTrashCollisions()
     end
 end)
-swerve:Slider("Server ghost cutoff", 350, 10, 100, 500, " studs", function(v)
+swerve:Slider("Server ghost cutoff", 100, 5, 60, 160, " studs", function(v)
     State.serverGhostCutoff = v
 end)
 swerve:Button("Click Retry now", function()
