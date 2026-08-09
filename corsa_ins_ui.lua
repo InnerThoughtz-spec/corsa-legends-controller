@@ -139,6 +139,8 @@ local State = {
     groundTrackFallbacks = 0,
     groundTrackStatus = "legacy",
     avoidLeftRail = true,
+    leftRailGuardActive = false,
+    leftRailCorrections = 0,
     targetLane = 2,
     trafficNoCollision = true,
     trafficDetected = 0,
@@ -226,6 +228,7 @@ local retryDetectionSuppressedUntil = 0
 local retrySignalLatchedUntil = 0
 local retrySignalFrames = 0
 local retryPending = false
+local retryVerifyingMotion = false
 local retryRunId = 0
 local swerveControlSuppressedUntil = 0
 local antiAfkNextAt = tick() + State.antiAfkInterval
@@ -241,10 +244,10 @@ local groundLockToggle
 
 local win = Lib:CreateWindow({
     title = "Corsa Controller",
-    subtitle = "spawn-safe steering + signal-confirmed Retry v25",
+    subtitle = "hard left-rail guard + motion-confirmed Retry v26",
     size = Vector2.new(720, 540),
     menuKey = "p",
-    configName = "corsa-controller-v25",
+    configName = "corsa-controller-v26",
     configFolder = "corsa-controller",
     accentA = Color3.fromRGB(84, 168, 255),
     accentB = Color3.fromRGB(105, 255, 202),
@@ -759,6 +762,10 @@ local function enterSwerveCourse(notifyUser)
     State.serverGhostsRemoved = 0
     resetServerGhosts()
 
+    local heliStart = getSwerveRemote("HeliStart")
+    if heliStart then
+        pcall(function() heliStart:FireServer() end)
+    end
     local scoreStart = getSwerveRemote("ScoreStart")
     if scoreStart then
         pcall(function() scoreStart:FireServer() end)
@@ -1504,14 +1511,19 @@ local function clickRetryButton(retry)
     local oldX = mouse and mouse.X
     local oldY = mouse and mouse.Y
 
-    local clicked = false
     local ok = pcall(function()
-        mousemoveabs(position.X + size.X * 0.5, position.Y + size.Y * 0.5)
-        mouse1click()
-        clicked = true
-        if oldX and oldY then mousemoveabs(oldX, oldY) end
+        task.spawn(function()
+            mousemoveabs(position.X + size.X * 0.5, position.Y + size.Y * 0.5)
+            -- Give Roblox a frame to register hover before the down/up gesture.
+            task.wait(0.06)
+            mouse1press()
+            task.wait(0.05)
+            mouse1release()
+            task.wait(0.04)
+            if oldX and oldY then mousemoveabs(oldX, oldY) end
+        end)
     end)
-    return ok and clicked
+    return ok
 end
 
 local function clickSwerveRetry(force)
@@ -1595,10 +1607,45 @@ local function clickSwerveRetry(force)
                     State.swerveEnabled = true
                     swerveControlSuppressedUntil = tick() + 1.25
                     if enterSwerveCourse(false) then
-                        restarted = true
-                        break
+                        retryVerifyingMotion = true
+                        State.retryState = "verifying forward motion"
+                        local startZ = root.Position.Z
+                        local motionDeadline = tick() + 2.75
+                        while _G.__CorsaBoostToken == token
+                            and retryRunId == thisRetry
+                            and tick() < motionDeadline do
+                            local liveVelocity = root.AssemblyLinearVelocity
+                            if math.abs(liveVelocity.Z) > 12
+                                or math.abs(root.Position.Z - startZ) > 2 then
+                                restarted = true
+                                break
+                            end
+                            task.wait(0.10)
+                        end
+                        retryVerifyingMotion = false
+                        if restarted then break end
+
+                        State.swerveEnabled = false
+                        if State.retryAttempts < 2 then
+                            local retryHesi = getSwerveGui()
+                            local retryButton = retryHesi
+                                and retryHesi:FindFirstChild("Retry")
+                            if retryButton and clickRetryButton(retryButton) then
+                                State.retryAttempts = 2
+                                lastRetryClick = tick()
+                                stableFrames = 0
+                                settleDeadline = tick() + 4.0
+                                State.retryState = "second Retry click sent"
+                                task.wait(0.85)
+                            else
+                                break
+                            end
+                        else
+                            break
+                        end
+                    else
+                        State.swerveEnabled = false
                     end
-                    State.swerveEnabled = false
                 end
             else
                 stableFrames = 0
@@ -1607,6 +1654,7 @@ local function clickSwerveRetry(force)
         end
 
         retryPending = false
+        retryVerifyingMotion = false
         State.retryPending = false
         retrySignalFrames = 0
         State.retrySignalFrames = 0
@@ -1621,11 +1669,11 @@ local function clickSwerveRetry(force)
             Lib:Notify("Swerve", "Retry confirmed; vehicle settled and farm resumed", 3, "success")
         else
             State.swerveEnabled = false
-            State.retryState = "vehicle did not settle"
-            State.retryReason = "respawn/seat required"
+            State.retryState = "Retry did not unlock motion"
+            State.retryReason = "manual Retry/respawn required"
             Lib:Notify(
                 "Swerve Retry",
-                "Retry closed, but no stable occupied vehicle appeared; autofarm remains paused",
+                "Retry did not unlock forward motion after two attempts; autofarm remains paused",
                 4,
                 "warning"
             )
@@ -2325,6 +2373,13 @@ swerve:Label(function()
         .. " | lane 1 permanently locked"
 end)
 swerve:Label(function()
+    return State.leftRailGuardActive
+        and ("LEFT RAIL RECOVERY | corrections: "
+            .. tostring(State.leftRailCorrections))
+        or ("Left-rail hard guard: armed | corrections: "
+            .. tostring(State.leftRailCorrections))
+end)
+swerve:Label(function()
     local actual = currentRoot and currentRoot.AssemblyLinearVelocity.Magnitude
         * MPH_PER_STUD_PER_SECOND or 0
     return "Farm speed: " .. tostring(math.floor(actual + 0.5))
@@ -2576,7 +2631,7 @@ task.spawn(function()
                 local output = velocity
                 local changed = false
 
-                if retryPending then
+                if retryPending and not retryVerifyingMotion then
                     output = Vector3.new(
                         0,
                         clamp(velocity.Y, -3, State.maxRise),
@@ -2596,6 +2651,34 @@ task.spawn(function()
                                 "error"
                             )
                         end
+                    elseif State.avoidLeftRail
+                        and position.X < swerveLeftBoundaryX then
+                        swerveLane = 2
+                        State.targetLane = 2
+                        swerveLaneSwitching = false
+                        State.laneSwitching = false
+                        swerveMicroOffset = 0
+                        swerveMicroNeedsRecovery = false
+                        State.leftRailGuardActive = true
+                        State.leftRailCorrections = State.leftRailCorrections + 1
+                        State.microSwervePhase = "LEFT RAIL RECOVERY"
+                        local emergencyX = clamp(
+                            (swerveLanes[2] - position.X) * 2.5,
+                            10,
+                            24
+                        )
+                        local saferForward = math.min(State.swerveSpeed, 360)
+                        local emergencyZ = velocity.Z + clamp(
+                            saferForward - velocity.Z,
+                            -State.swerveAcceleration * dt,
+                            State.swerveAcceleration * dt
+                        )
+                        output = Vector3.new(
+                            emergencyX,
+                            clamp(velocity.Y, -3, State.maxRise),
+                            emergencyZ
+                        )
+                        changed = true
                     elseif tick() < swerveControlSuppressedUntil then
                         -- During spawn/Retry settling, discard inherited lateral
                         -- motion and leave lane selection untouched. This is the
@@ -2606,8 +2689,10 @@ task.spawn(function()
                             velocity.Z
                         )
                         State.microSwervePhase = "spawn settling"
+                        State.leftRailGuardActive = false
                         changed = true
                     else
+                        State.leftRailGuardActive = false
                         output = State.groundTrackLock
                             and buildExperimentalSwerveVelocity(root, velocity, dt)
                             or buildLegacySwerveVelocity(velocity, position, dt)

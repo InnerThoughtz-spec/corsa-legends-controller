@@ -8,4 +8,4 @@ INS-ui speed, grip, suspension, high-speed stability, and Swerve automation cont
 loadstring(game:HttpGet("https://raw.githubusercontent.com/InnerThoughtz-spec/corsa-legends-controller/main/corsa_ins_ui.lua"))()
 ```
 
-Version 25 adds spawn-safe lateral settling, Fail/score-confirmed Retry recovery, and click-only Anti-AFK at a 19-minute default interval.
+Version 26 adds a hard left-rail recovery boundary, motion-confirmed Retry recovery with the complete Swerve start sequence, and click-only Anti-AFK at a 19-minute default interval.
