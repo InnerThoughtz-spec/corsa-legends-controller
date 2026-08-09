@@ -122,6 +122,14 @@ local State = {
     microSwerveAcceleration = 18,
     microSwervePhase = "center",
     microSwerveCount = 0,
+    laneAlternation = true,
+    laneSwitchPause = 0.85,
+    laneTransitionSpeed = 6,
+    laneTransitionAcceleration = 30,
+    laneSwitching = false,
+    groundTrackLock = true,
+    groundTrackHeight = 0,
+    groundTrackCorrections = 0,
     avoidLeftRail = true,
     targetLane = 2,
     trafficNoCollision = true,
@@ -180,6 +188,10 @@ local swerveMicroNeedsRecovery = false
 local swerveLanes = { 4805.187, 4821.565, 4837.794 }
 local swerveStartZ = 19215
 local swerveForward = Vector3.new(0, 0, 1)
+local swerveGroundY
+local swerveNextLaneSwitchAt = 0
+local swerveLaneSwitching = false
+local swerveLeftBoundaryX = 4814
 local swerveFaulted = false
 local ghostedTrafficParts = {}
 local collisionParts = {}
@@ -207,10 +219,10 @@ local fullTuneValueBox
 
 local win = Lib:CreateWindow({
     title = "Corsa Controller",
-    subtitle = "stable chassis + Swerve v20",
+    subtitle = "ground-locked two-lane Swerve v21",
     size = Vector2.new(720, 540),
     menuKey = "p",
-    configName = "corsa-controller-v20",
+    configName = "corsa-controller-v21",
     configFolder = "corsa-controller",
     accentA = Color3.fromRGB(84, 168, 255),
     accentB = Color3.fromRGB(105, 255, 202),
@@ -634,6 +646,9 @@ local function resolveSwerveCourse()
             if #found == 3 then
                 table.sort(found)
                 swerveLanes = found
+                -- Keep the entire vehicle well inside the middle lane. The
+                -- boundary sits past the Lane1/Lane2 midpoint toward Lane2.
+                swerveLeftBoundaryX = (found[1] + found[2]) * 0.5 + 1.5
                 swerveStartZ = firstZ + 42
                 return true
             end
@@ -693,10 +708,16 @@ local function enterSwerveCourse(notifyUser)
     currentRoot = root
 
     resolveSwerveCourse()
-    -- The center/right lanes keep the farm away from the trash-lined left rail.
+    -- Lane 1 is permanently forbidden. Only the middle and right lanes are used.
     local detectedLane = nearestSwerveLane(root.Position.X)
-    swerveLane = State.avoidLeftRail and math.max(2, detectedLane) or detectedLane
+    swerveLane = math.max(2, math.min(3, detectedLane))
     State.targetLane = swerveLane
+    swerveGroundY = root.Position.Y
+    State.groundTrackHeight = swerveGroundY
+    State.groundTrackCorrections = 0
+    swerveLaneSwitching = false
+    State.laneSwitching = false
+    swerveNextLaneSwitchAt = tick() + State.laneSwitchPause
     swerveMicroOffset = 0
     swerveMicroDirection = 1
     swerveMicroReturnAt = 0
@@ -729,13 +750,25 @@ end
 local function stabilizeSwerveCar(root)
     if not root then return end
     local detectedLane = nearestSwerveLane(root.Position.X)
-    swerveLane = State.avoidLeftRail and math.max(2, detectedLane) or detectedLane
+    swerveLane = math.max(2, math.min(3, detectedLane))
     State.targetLane = swerveLane
+    swerveGroundY = root.Position.Y
+    State.groundTrackHeight = swerveGroundY
+    swerveLaneSwitching = false
+    State.laneSwitching = false
+    swerveNextLaneSwitchAt = tick() + State.laneSwitchPause
     pcall(function()
         local velocity = root.AssemblyLinearVelocity
+        local position = root.Position
+        local lockedX = math.max(position.X, swerveLeftBoundaryX)
+        root.CFrame = CFrame.lookAt(
+            Vector3.new(lockedX, swerveGroundY, position.Z),
+            Vector3.new(lockedX, swerveGroundY, position.Z) + swerveForward,
+            Vector3.new(0, 1, 0)
+        )
         root.AssemblyLinearVelocity = Vector3.new(
             0,
-            clamp(velocity.Y, -4, State.maxRise),
+            0,
             math.max(velocity.Z, 45)
         )
     end)
@@ -818,6 +851,75 @@ local function updateMicroSwerve()
     end
 
     return swerveMicroOffset
+end
+
+local function updateTwoLaneTarget(positionX)
+    local now = tick()
+    swerveLane = math.max(2, math.min(3, swerveLane))
+
+    if not State.laneAlternation then
+        swerveLaneSwitching = false
+        State.laneSwitching = false
+        State.microSwervePhase = swerveLane == 2 and "middle lane" or "right lane"
+        State.targetLane = swerveLane
+        return
+    end
+
+    local laneCenter = swerveLanes[swerveLane]
+    local settled = math.abs(positionX - laneCenter) <= 0.35
+
+    if swerveLaneSwitching then
+        if settled then
+            swerveLaneSwitching = false
+            State.laneSwitching = false
+            State.microSwervePhase = swerveLane == 2
+                and "settled middle" or "settled right"
+            swerveNextLaneSwitchAt = now + State.laneSwitchPause
+        end
+    elseif settled and now >= swerveNextLaneSwitchAt then
+        swerveLane = swerveLane == 2 and 3 or 2
+        swerveLaneSwitching = true
+        State.laneSwitching = true
+        State.targetLane = swerveLane
+        State.microSwerveCount = State.microSwerveCount + 1
+        State.microSwervePhase = swerveLane == 2
+            and "right -> middle" or "middle -> right"
+    end
+
+    State.targetLane = swerveLane
+end
+
+local function enforceSwerveTrackLock(root)
+    if not (State.groundTrackLock and root) then return false end
+
+    local position = root.Position
+    if not swerveGroundY then
+        swerveGroundY = position.Y
+        State.groundTrackHeight = swerveGroundY
+    end
+
+    local look = root.CFrame.LookVector
+    local up = root.CFrame.UpVector
+    local lockedX = math.max(position.X, swerveLeftBoundaryX)
+    local heightError = math.abs(position.Y - swerveGroundY)
+    local notStraight = math.abs(look.X) > 0.003
+        or math.abs(look.Y) > 0.003
+        or look.Z < 0.99995
+        or up.Y < 0.99995
+    local crossedBoundary = position.X < swerveLeftBoundaryX
+
+    if not (heightError > 0.08 or notStraight or crossedBoundary) then
+        return false
+    end
+
+    local lockedPosition = Vector3.new(lockedX, swerveGroundY, position.Z)
+    root.CFrame = CFrame.lookAt(
+        lockedPosition,
+        lockedPosition + swerveForward,
+        Vector3.new(0, 1, 0)
+    )
+    State.groundTrackCorrections = State.groundTrackCorrections + 1
+    return true
 end
 
 local function updateSwerveLane()
@@ -1735,33 +1837,30 @@ end)
 swerve:Slider("Lane centering brake", 36, 2, 18, 36, "", function(v)
     State.swerveLaneAcceleration = math.min(v, SWERVE_MAX_LATERAL_ACCELERATION)
 end)
-swerve:Toggle("Avoid left guard rail", true, function(on)
-    State.avoidLeftRail = on
-    if on and swerveLane < 2 then swerveLane = 2 end
-    State.targetLane = swerveLane
+swerve:Toggle("Alternate middle/right lanes", true, function(on)
+    State.laneAlternation = on
+    swerveLane = math.max(2, math.min(3, swerveLane))
+    swerveLaneSwitching = false
+    State.laneSwitching = false
+    swerveNextLaneSwitchAt = tick() + State.laneSwitchPause
 end)
-swerve:Toggle("Micro-swerve taps", true, function(on)
-    State.microSwerveEnabled = on
-    if not on then
-        swerveMicroOffset = 0
-        swerveMicroRecoverUntil = 0
-        swerveMicroNeedsRecovery = false
-        State.microSwervePhase = "center"
+swerve:Slider("Pause after each lane", 0.85, 0.05, 0.25, 2.5, "s", function(v)
+    State.laneSwitchPause = v
+end)
+swerve:Slider("Lane transition speed", 6, 0.5, 3, 6, "", function(v)
+    State.laneTransitionSpeed = math.min(v, SWERVE_MAX_LATERAL_SPEED)
+end)
+swerve:Slider("Lane transition brake", 30, 2, 12, 36, "", function(v)
+    State.laneTransitionAcceleration = math.min(v, SWERVE_MAX_LATERAL_ACCELERATION)
+end)
+swerve:Toggle("Ground-level straight lock", true, function(on)
+    State.groundTrackLock = on
+    if on and currentRoot then
+        swerveGroundY = currentRoot.Position.Y
+        State.groundTrackHeight = swerveGroundY
     end
 end)
-swerve:Slider("Light tap width", 1.25, 0.25, 0.5, 1.75, " studs", function(v)
-    State.microSwerveWidth = math.min(v, MICRO_SWERVE_MAX_WIDTH)
-end)
-swerve:Slider("Light tap hold", 0.15, 0.01, 0.08, 0.18, "s", function(v)
-    State.microSwerveHold = math.min(v, MICRO_SWERVE_MAX_HOLD)
-end)
-swerve:Slider("Tap strength", 3.0, 0.25, 1.5, 4.0, "", function(v)
-    State.microSwerveLateralSpeed = math.min(v, 4.0)
-end)
-swerve:Slider("Time between taps", 1.00, 0.05, 0.60, 2.0, "s", function(v)
-    State.microSwervePause = v
-end)
-swerve:Info("Light-tap mode adds a brief, low-strength A/D nudge and eases back to lane center. It never performs a full lane change.")
+swerve:Info("Lane 1 is permanently locked out. The farm alternates only between the middle and right lanes while holding a flat, straight road-height track.")
 swerve:Button("Initialize from current position", function()
     _G.__CorsaStartSwerve()
 end)
@@ -1820,7 +1919,7 @@ swerve:Button("Reset server traffic ghosts", function()
 end)
 swerve:Label(function()
     return "Target lane: " .. tostring(swerveLane)
-        .. (State.avoidLeftRail and " | left rail locked out" or "")
+        .. " | lane 1 permanently locked"
 end)
 swerve:Label(function()
     local actual = currentRoot and currentRoot.AssemblyLinearVelocity.Magnitude
@@ -1829,8 +1928,13 @@ swerve:Label(function()
         .. " / " .. tostring(State.swerveTargetMPH) .. " MPH"
 end)
 swerve:Label(function()
-    return "Micro-swerve: " .. tostring(State.microSwervePhase)
-        .. " | taps: " .. tostring(State.microSwerveCount)
+    return "Lane cycle: " .. tostring(State.microSwervePhase)
+        .. " | switches: " .. tostring(State.microSwerveCount)
+end)
+swerve:Label(function()
+    return "Track lock: " .. (State.groundTrackLock and "active" or "off")
+        .. " | height: " .. tostring(math.floor(State.groundTrackHeight * 100 + 0.5) / 100)
+        .. " | corrections: " .. tostring(State.groundTrackCorrections)
 end)
 swerve:Label(function()
     if not State.swerveEnabled then return "Farm: stopped" end
@@ -2053,34 +2157,31 @@ task.spawn(function()
                             )
                         end
                     else
+                        enforceSwerveTrackLock(root)
+                        position = root.Position
+                        updateTwoLaneTarget(position.X)
+
                         local laneGap = math.min(
                             swerveLanes[2] - swerveLanes[1],
                             swerveLanes[3] - swerveLanes[2]
                         )
-                        local safeMargin = math.max(2, laneGap * 0.22)
-                        local safeLeft = State.avoidLeftRail
-                            and (swerveLanes[1] - 1.5)
-                            or (swerveLanes[1] - safeMargin)
-                        local safeRight = swerveLanes[3] + safeMargin
-
-                        local microOffset = updateMicroSwerve()
-                        local lightTapActive = microOffset ~= 0
-                            or swerveMicroNeedsRecovery
-                        local lateralAcceleration = lightTapActive
-                            and State.microSwerveAcceleration
+                        local safeLeft = swerveLeftBoundaryX
+                        local safeRight = swerveLanes[3] + laneGap * 0.20
+                        local lateralAcceleration = swerveLaneSwitching
+                            and State.laneTransitionAcceleration
                             or math.min(
                                 State.swerveLaneAcceleration,
                                 SWERVE_MAX_LATERAL_ACCELERATION
                             )
-                        local lateralSpeedLimit = lightTapActive
-                            and math.min(State.microSwerveLateralSpeed, 4)
+                        local lateralSpeedLimit = swerveLaneSwitching
+                            and State.laneTransitionSpeed
                             or math.min(
                                 State.swerveLaneSpeed,
                                 SWERVE_MAX_LATERAL_SPEED
                             )
                         local laneCenterX = swerveLanes[swerveLane]
                         local targetX = clamp(
-                            laneCenterX + microOffset,
+                            laneCenterX,
                             safeLeft,
                             safeRight
                         )
@@ -2095,7 +2196,7 @@ task.spawn(function()
 
                         local lateralStep = math.min(
                             lateralAcceleration * dt,
-                            lightTapActive and 1.5 or 5
+                            swerveLaneSwitching and 2.5 or 5
                         )
                         local newX = output.X + clamp(
                             desiredX - output.X,
@@ -2104,34 +2205,39 @@ task.spawn(function()
                         )
                         newX = clamp(newX, -lateralSpeedLimit, lateralSpeedLimit)
 
-                        -- Never let a leftward velocity carry the car into the
-                        -- trash-lined guard rail. From lane 1, always recover right.
-                        if State.avoidLeftRail then
-                            if position.X <= swerveLanes[1] - 1.5 then
-                                newX = math.max(newX, 5)
-                            elseif position.X <= swerveLanes[1] + 2 then
-                                newX = math.max(newX, 2.5)
-                            end
+                        -- This hard boundary is inside lane 2. No controller
+                        -- state can select or drift into the left-most lane.
+                        if position.X <= swerveLeftBoundaryX + 0.5 then
+                            newX = math.max(newX, 4)
                         end
 
-                        if microOffset == 0
-                            and math.abs(position.X - laneCenterX) < 0.25
-                            and math.abs(newX) < 0.50 then
-                            swerveMicroNeedsRecovery = false
+                        if not swerveLaneSwitching
+                            and math.abs(position.X - laneCenterX) < 0.20
+                            and math.abs(newX) < 0.75 then
+                            newX = 0
                         end
                         local newZ = output.Z + clamp(
                             State.swerveSpeed - output.Z,
                             -State.swerveAcceleration * dt,
                             State.swerveAcceleration * dt
                         )
-                        local newY = clamp(output.Y, -3, State.maxRise)
-                        output = Vector3.new(newX, newY, newZ)
+                        output = Vector3.new(newX, 0, newZ)
 
                         -- The game fails Swerve when speed changes by 10 or more
-                        -- in one frame. Keep every controller correction below it.
-                        local velocityDelta = output - velocity
-                        if velocityDelta.Magnitude > 7.5 then
-                            output = velocity + velocityDelta.Unit * 7.5
+                        -- in one frame. Limit X/Z changes while vertical velocity
+                        -- stays zero so bumps cannot destabilize the body.
+                        local horizontalDelta = Vector3.new(
+                            output.X - velocity.X,
+                            0,
+                            output.Z - velocity.Z
+                        )
+                        if horizontalDelta.Magnitude > 7.5 then
+                            local limited = horizontalDelta.Unit * 7.5
+                            output = Vector3.new(
+                                velocity.X + limited.X,
+                                0,
+                                velocity.Z + limited.Z
+                            )
                         end
                         changed = true
                     end
