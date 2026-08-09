@@ -165,6 +165,13 @@ local State = {
     serverGhostCutoff = 100,
     serverGhostsRemoved = 0,
     serverGhostResets = 0,
+    driveLoopTicks = 0,
+    driveLoopErrors = 0,
+    driveLoopError = "none",
+    driveLoopPulse = 0,
+    stallRecoveries = 0,
+    stallStatus = "monitoring",
+    stallSpeed = 0,
     autoRetry = true,
     retryCount = 0,
     retryArmed = false,
@@ -255,10 +262,10 @@ local groundLockToggle
 
 local win = Lib:CreateWindow({
     title = "Corsa Controller",
-    subtitle = "score-safe traffic guard + roadside ghosting v30",
+    subtitle = "self-healing propulsion + score-safe traffic v31",
     size = Vector2.new(720, 540),
     menuKey = "p",
-    configName = "corsa-controller-v30",
+    configName = "corsa-controller-v31",
     configFolder = "corsa-controller",
     accentA = Color3.fromRGB(84, 168, 255),
     accentB = Color3.fromRGB(105, 255, 202),
@@ -2631,6 +2638,12 @@ task.spawn(function()
         if address ~= currentAddress
             or liveRootAddress ~= cachedRootAddress then
             captureCar(car)
+        elseif car and liveRoot then
+            -- Matcha may hand out a stale wrapper for a chassis part rebuilt by
+            -- Retry even when Roblox reuses the same underlying address.
+            currentCar = car
+            currentAddress = address
+            currentRoot = liveRoot
         end
 
         task.wait(car and 0.20 or 0.01)
@@ -2708,6 +2721,69 @@ task.spawn(function()
 end)
 
 task.spawn(function()
+    local stalledSince
+    local lastStartSignal = 0
+
+    while _G.__CorsaBoostToken == token do
+        local now = tick()
+        local root = currentRoot
+        local shouldDrive = State.enabled
+            and State.swerveEnabled
+            and not retryPending
+            and root
+            and now >= swerveControlSuppressedUntil
+
+        if shouldDrive then
+            local velocity = root.AssemblyLinearVelocity
+            State.stallSpeed = math.abs(velocity.Z)
+            if velocity.Z < 8 then
+                stalledSince = stalledSince or now
+                State.stallStatus = "stationary detected"
+                if now - stalledSince >= 1.25 then
+                    local hesi = getSwerveGui()
+                    local fail = hesi and hesi:FindFirstChild("Fail")
+                    if not (fail and fail.Value == true) then
+                        if readSwerveScore() <= 0 and now - lastStartSignal >= 8 then
+                            local heliStart = getSwerveRemote("HeliStart")
+                            local scoreStart = getSwerveRemote("ScoreStart")
+                            if heliStart then
+                                pcall(function() heliStart:FireServer() end)
+                            end
+                            if scoreStart then
+                                pcall(function() scoreStart:FireServer() end)
+                            end
+                            lastStartSignal = now
+                        end
+
+                        pcall(function()
+                            root.AssemblyLinearVelocity = Vector3.new(
+                                0,
+                                clamp(velocity.Y, -3, State.maxRise),
+                                math.max(45, velocity.Z)
+                            )
+                        end)
+                        State.stallRecoveries = State.stallRecoveries + 1
+                        State.stallStatus = "forward recovery sent"
+                        stalledSince = now
+                    else
+                        State.stallStatus = "waiting for Retry"
+                    end
+                end
+            else
+                stalledSince = nil
+                State.stallStatus = "moving"
+            end
+        else
+            stalledSince = nil
+            State.stallSpeed = root and math.abs(root.AssemblyLinearVelocity.Z) or 0
+            State.stallStatus = retryPending and "Retry pending" or "monitoring"
+        end
+
+        task.wait(0.20)
+    end
+end)
+
+task.spawn(function()
     while _G.__CorsaBoostToken == token do
         local now = tick()
         if State.antiAfk then
@@ -2738,9 +2814,12 @@ task.spawn(function()
     local dt = 1 / 20
 
     while _G.__CorsaBoostToken == token do
+        State.driveLoopTicks = State.driveLoopTicks + 1
+        State.driveLoopPulse = tick()
+        local ok, driveErr = pcall(function()
         local seat = currentSeat
         local root = currentRoot
-        local orientation = seat or root
+        local orientation = State.swerveEnabled and root or (seat or root)
 
         if State.enabled and root and orientation then
             local velocity = root.AssemblyLinearVelocity
@@ -2856,6 +2935,14 @@ task.spawn(function()
                     root.AssemblyLinearVelocity = output
                 end
             end
+        end
+        end)
+
+        if ok then
+            State.driveLoopError = "none"
+        else
+            State.driveLoopErrors = State.driveLoopErrors + 1
+            State.driveLoopError = tostring(driveErr)
         end
 
         task.wait(dt)
