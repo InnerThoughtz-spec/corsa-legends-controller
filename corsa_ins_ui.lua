@@ -1702,7 +1702,7 @@ local function updateRetryArm()
         lastObservedSwerveScore = score
     end
     State.retryArmed = signalConfirmed and now < retryArmedUntil
-    if not State.retryArmed and State.retryReason ~= "restart settling" then
+    if not State.retryArmed then
         State.retryReason = "monitoring"
     end
 end
