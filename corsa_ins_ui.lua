@@ -1,4 +1,4 @@
--- Corsa Legends Controller using INS-ui
+-- Corsa Legends Controller using NonUI
 -- Menu: P | Nitro: hold Left Shift
 -- Includes Swerve traffic farming, anti-AFK, and forced-induction tuning
 
@@ -21,13 +21,270 @@ if _G.__CorsaUI then
     pcall(function() _G.__CorsaUI:Destroy() end)
 end
 
--- Pin the known-good upstream revision. INS-ui renamed its implementation and
--- source file in August 2026, so rewriting its internals by function name is
--- deliberately avoided. This revision already cleans up hidden images itself.
-local INS_UI_URL = "https://raw.githubusercontent.com/neaxusxgod-png/INS-ui/6c9f402d87feb12c598b4f81727d918eceb3869c/uilib.min.lua"
-local uiSource = game:HttpGet(INS_UI_URL)
-local uiLoader = assert(loadstring(uiSource), "INS-ui source did not compile")
-local Lib = uiLoader() or INSui
+-- Pin NonUI so an upstream edit cannot silently break the controller.
+local NON_UI_URL = "https://raw.githubusercontent.com/neaxusxgod-png/NonUI/3b13bca61d9e103e1259f92b7f8dd0f39713777a/NonUI.lua"
+local uiSource = game:HttpGet(NON_UI_URL)
+local uiLoader = assert(loadstring(uiSource), "NonUI source did not compile")
+local Non = uiLoader() or NonUI
+
+-- The controller predates NonUI. This small adapter keeps its existing control
+-- declarations intact while letting NonUI own all rendering and input.
+local dynamicLabels = {}
+local iconAliases = {
+    gauge = "gauge",
+    sliders = "sliders-horizontal",
+    wrench = "wrench",
+    settings = "settings",
+    cog = "settings",
+}
+
+local function nonIcon(name)
+    return iconAliases[string.lower(tostring(name or ""))] or name
+end
+
+local function sliderRounding(step)
+    step = math.abs(tonumber(step) or 1)
+    for places = 0, 6 do
+        local scaled = step * (10 ^ places)
+        if math.abs(scaled - math.floor(scaled + 0.5)) < 0.000001 then
+            return places
+        end
+    end
+    return 6
+end
+
+local CompatElement = {}
+CompatElement.__index = CompatElement
+
+function CompatElement:AddKeybind(defaultKey, mode, callback)
+    self.rawTab:Keybind({
+        Title = self.title .. " key",
+        Default = string.lower(tostring(defaultKey or "")),
+        Mode = mode or "Toggle",
+        Callback = function(_, active)
+            if active ~= nil then callback(active) end
+        end,
+    })
+    return self
+end
+
+function CompatElement:SetRisk()
+    pcall(function() self.raw:SetIcon("triangle-alert") end)
+    return self
+end
+
+function CompatElement:Set(value)
+    if self.dropdown and not self.multi and type(value) == "table" then
+        value = value[1]
+    end
+    if self.raw.Set then self.raw:Set(value) end
+    return self
+end
+
+function CompatElement:UpdateChoices(values)
+    if self.raw.Refresh then self.raw:Refresh(values or {}) end
+    return self
+end
+
+local function wrapElement(raw, rawTab, title, options)
+    options = options or {}
+    return setmetatable({
+        raw = raw,
+        rawTab = rawTab,
+        title = title or "Control",
+        dropdown = options.dropdown,
+        multi = options.multi,
+    }, CompatElement)
+end
+
+local CompatSection = {}
+CompatSection.__index = CompatSection
+
+function CompatSection:Toggle(title, default, callback)
+    local raw = self.rawTab:Toggle({
+        Title = title,
+        Default = default,
+        Callback = callback,
+    })
+    return wrapElement(raw, self.rawTab, title)
+end
+
+function CompatSection:Slider(title, default, step, minimum, maximum, suffix, callback)
+    local raw = self.rawTab:Slider({
+        Title = title,
+        Default = default,
+        Step = step,
+        Min = minimum,
+        Max = maximum,
+        Suffix = suffix or "",
+        Rounding = sliderRounding(step),
+        Callback = callback,
+    })
+    return wrapElement(raw, self.rawTab, title)
+end
+
+function CompatSection:Button(title, callback)
+    local raw = self.rawTab:Button({
+        Title = title,
+        Callback = callback,
+    })
+    return wrapElement(raw, self.rawTab, title)
+end
+
+function CompatSection:Label(value)
+    local callback = type(value) == "function" and value or nil
+    local initial = value
+    if callback then
+        local ok, result = pcall(callback)
+        initial = ok and result or "Waiting for status"
+    end
+    local raw = self.rawTab:Paragraph({ Title = tostring(initial or "") })
+    if callback then
+        dynamicLabels[#dynamicLabels + 1] = {
+            raw = raw,
+            callback = callback,
+        }
+    end
+    return wrapElement(raw, self.rawTab, tostring(initial or ""))
+end
+
+function CompatSection:Info(text)
+    local raw = self.rawTab:Paragraph({
+        Title = "Info",
+        Desc = tostring(text or ""),
+        Icon = "info",
+    })
+    return wrapElement(raw, self.rawTab, "Info")
+end
+
+function CompatSection:Textbox(title, default, callback, description)
+    local raw = self.rawTab:Input({
+        Title = title,
+        Default = tostring(default or ""),
+        Desc = description,
+        Callback = callback,
+    })
+    return wrapElement(raw, self.rawTab, title)
+end
+
+function CompatSection:Dropdown(title, default, choices, multi, callback, description, searchable)
+    local normalizedDefault = default
+    if not multi and type(normalizedDefault) == "table" then
+        normalizedDefault = normalizedDefault[1]
+    end
+    local raw = self.rawTab:Dropdown({
+        Title = title,
+        Default = normalizedDefault,
+        Values = choices or {},
+        Multi = multi and true or false,
+        Desc = description,
+        SearchBarEnabled = searchable and true or false,
+        AllowNone = true,
+        Callback = function(value)
+            if multi then
+                callback(value or {})
+            else
+                callback(value ~= nil and { value } or {})
+            end
+        end,
+    })
+    return wrapElement(raw, self.rawTab, title, {
+        dropdown = true,
+        multi = multi and true or false,
+    })
+end
+
+function CompatSection:Divider(title)
+    if title and title ~= "" then
+        self.rawTab:Section({ Title = title })
+    else
+        self.rawTab:Divider({})
+    end
+    return self
+end
+
+local CompatTab = {}
+CompatTab.__index = CompatTab
+
+function CompatTab:Section(title, _, description)
+    self.rawTab:Section({ Title = title, Desc = description })
+    return setmetatable({ rawTab = self.rawTab }, CompatSection)
+end
+
+local CompatWindow = {}
+CompatWindow.__index = CompatWindow
+
+function CompatWindow:Tab(title, icon)
+    local rawTab = self.band:Tab({ Title = title, Icon = nonIcon(icon) })
+    return setmetatable({ rawTab = rawTab }, CompatTab)
+end
+
+function CompatWindow:SetSize(width, height)
+    self.raw.w = tonumber(width) or self.raw.w
+    self.raw.h = tonumber(height) or self.raw.h
+    return self
+end
+
+function CompatWindow:Center()
+    pcall(function()
+        local viewport = game.Workspace.CurrentCamera.ViewportSize
+        self.raw.x = math.floor((viewport.X - self.raw.w) * 0.5)
+        self.raw.y = math.floor((viewport.Y - self.raw.h) * 0.5)
+    end)
+    return self
+end
+
+function CompatWindow:SetOpen(open)
+    if open then self.raw:Open() else self.raw:Close() end
+    return self
+end
+
+function CompatWindow:AddSettingsTab()
+    return self
+end
+
+function CompatWindow:Destroy()
+    self.raw:Destroy()
+end
+
+local Lib = {}
+
+function Lib:CreateWindow()
+    local raw = Non:CreateWindow({
+        Title = "Corsa Controller",
+        Author = "vehicle controller v35",
+        Theme = "Dark",
+        Size = { 720, 540 },
+        MinSize = { 620, 440 },
+        Resizable = true,
+        ToggleKey = "p",
+        Footer = "P toggles the menu",
+        OpenButton = {
+            Title = "Corsa",
+            OnlyIcon = false,
+            Draggable = true,
+            Scale = 1,
+        },
+    })
+    return setmetatable({
+        raw = raw,
+        band = raw:Section({ Title = "Controller" }),
+    }, CompatWindow)
+end
+
+function Lib:Notify(title, content, duration, kind)
+    local icons = {
+        success = "circle-check",
+        warning = "triangle-alert",
+        error = "circle-alert",
+    }
+    Non:Notify({
+        Title = tostring(title or "Corsa"),
+        Content = tostring(content or ""),
+        Duration = duration or 4,
+        Icon = icons[kind] or "info",
+    })
+end
 local MPH_PER_STUD_PER_SECOND = 0.626342
 local SWERVE_MAX_MPH = 370
 local MICRO_SWERVE_MAX_WIDTH = 1.75
@@ -76,6 +333,7 @@ local State = {
     superResponse = 0.60,
 
     swerveEnabled = false,
+    propulsionArmed = false,
     swerveAutoEnter = true,
     swerveTargetMPH = SWERVE_MAX_MPH,
     swerveSpeed = SWERVE_MAX_MPH / MPH_PER_STUD_PER_SECOND,
@@ -213,6 +471,7 @@ local retrySignalFrames = 0
 local retryPending = false
 local retryVerifyingMotion = false
 local retryRunId = 0
+local retryShouldResume = false
 local swerveControlSuppressedUntil = 0
 local antiAfkNextAt = tick() + State.antiAfkInterval
 local fullTuneOverrides = {}
@@ -225,40 +484,12 @@ local fullTuneDropdown
 local fullTuneValueBox
 local groundLockToggle
 
-local win = Lib:CreateWindow({
-    title = "Corsa Controller",
-    subtitle = "locked dark UI + self-healing propulsion v34",
-    size = Vector2.new(720, 540),
-    menuKey = "p",
-    configName = "corsa-controller-v34",
-    configFolder = "corsa-controller",
-    accentA = Color3.fromRGB(84, 168, 255),
-    accentB = Color3.fromRGB(105, 255, 202),
-    theme = {
-        bg = Color3.fromRGB(15, 15, 15),
-        sidebar = Color3.fromRGB(15, 15, 15),
-        text = Color3.fromRGB(238, 241, 247),
-        idle = Color3.fromRGB(158, 164, 176),
-        track = Color3.fromRGB(58, 62, 72),
-        slider = Color3.fromRGB(78, 84, 98),
-        risk = Color3.fromRGB(255, 190, 70),
-    },
-    backgroundEffect = "Off",
-    backgroundEffectColor = Color3.fromRGB(84, 168, 255),
-    opacity = 0.96,
-    rounding = 1.2,
-    rowLines = true,
-    smartFps = false,
-    gameInput = true,
-    autoSave = false,
-    startOpen = true,
-    keybindOverlay = true,
-})
+local win = Lib:CreateWindow()
 
 _G.__CorsaUI = win
 
--- Keep initial input/config timing from leaving the new INS-ui window closed,
--- off-center, or partially faded on its first frame.
+-- NonUI starts centered and open; repeat once after its first draw frame so a
+-- viewport transition during load cannot leave the window off-screen.
 win:SetSize(720, 540)
 win:Center()
 win:SetOpen(true)
@@ -268,6 +499,23 @@ task.spawn(function()
         win:SetSize(720, 540)
         win:Center()
         win:SetOpen(true)
+    end
+end)
+
+-- Update every live status paragraph together. A single refresh loop is much
+-- lighter than giving each label its own task.
+task.spawn(function()
+    while _G.__CorsaBoostToken == token do
+        for i = #dynamicLabels, 1, -1 do
+            local labelState = dynamicLabels[i]
+            local ok, value = pcall(labelState.callback)
+            if ok and labelState.raw then
+                pcall(function()
+                    labelState.raw:SetTitle(tostring(value or ""))
+                end)
+            end
+        end
+        task.wait(0.40)
     end
 end)
 
@@ -799,13 +1047,14 @@ local function stabilizeSwerveCar(root)
         root.AssemblyLinearVelocity = Vector3.new(
             0,
             State.groundTrackLock and 0 or clamp(velocity.Y, -4, State.maxRise),
-            math.max(velocity.Z, 45)
+            velocity.Z
         )
     end)
 end
 
 _G.__CorsaStartSwerve = function()
     State.enabled = true
+    State.propulsionArmed = true
     State.swerveEnabled = true
     return enterSwerveCourse(true)
 end
@@ -815,6 +1064,7 @@ _G.__CorsaStopSwerve = function()
     retryPending = false
     State.retryPending = false
     State.retryState = "stopped"
+    State.propulsionArmed = false
     State.swerveEnabled = false
     swerveMicroOffset = 0
     swerveMicroRecoverUntil = 0
@@ -859,7 +1109,8 @@ end
 
 local function updateMicroSwerve()
     local now = tick()
-    if not (State.swerveEnabled and State.microSwerveEnabled) then
+    if not (State.propulsionArmed and State.swerveEnabled
+        and State.microSwerveEnabled) then
         swerveMicroOffset = 0
         swerveMicroRecoverUntil = 0
         swerveMicroNeedsRecovery = false
@@ -1135,7 +1386,7 @@ end
 
 local function updateSwerveLane()
     local root = currentRoot
-    if not (State.swerveEnabled and root) then return end
+    if not (State.propulsionArmed and State.swerveEnabled and root) then return end
 
     local traffic = game.Workspace:FindFirstChild("AITraffic")
     local cars = traffic and traffic:FindFirstChild("Car")
@@ -1412,7 +1663,8 @@ end
 
 local function removeImminentServerGhosts()
     local root = currentRoot
-    if not (State.serverGhostProtection and State.swerveEnabled and root) then
+    if not (State.serverGhostProtection and State.propulsionArmed
+        and State.swerveEnabled and root) then
         return
     end
 
@@ -1459,6 +1711,7 @@ local function enforceCrashGuard()
     local root = currentRoot
     local characterRoot = getCharacterRoot()
     local active = State.crashGuard
+        and State.propulsionArmed
         and State.swerveEnabled
         and root
         and characterRoot
@@ -1620,6 +1873,7 @@ local function clickSwerveRetry(force)
     if not retryIsOnScreen(retry) then return false end
     if not clickRetryButton(retry) then return false end
 
+    retryShouldResume = State.propulsionArmed and State.swerveEnabled
     lastRetryClick = tick()
     retryPending = true
     retryRunId = retryRunId + 1
@@ -1686,6 +1940,12 @@ local function clickSwerveRetry(force)
                     currentSeat = seat
                     currentRoot = root
                     State.enabled = true
+                    if not (retryShouldResume and State.propulsionArmed) then
+                        State.swerveEnabled = false
+                        State.retryState = "vehicle settled; propulsion disarmed"
+                        restarted = true
+                        break
+                    end
                     State.swerveEnabled = true
                     swerveControlSuppressedUntil = tick() + 1.25
                     if enterSwerveCourse(false) then
@@ -1748,8 +2008,16 @@ local function clickSwerveRetry(force)
             State.retryCount = State.retryCount + 1
             State.retryState = "recovered"
             State.retryReason = "monitoring"
-            Lib:Notify("Swerve", "Retry confirmed; vehicle settled and farm resumed", 3, "success")
+            Lib:Notify(
+                "Swerve",
+                retryShouldResume
+                    and "Retry confirmed; vehicle settled and farm resumed"
+                    or "Retry confirmed; vehicle settled with propulsion off",
+                3,
+                "success"
+            )
         else
+            State.propulsionArmed = false
             State.swerveEnabled = false
             State.retryState = "Retry did not unlock motion"
             State.retryReason = "manual Retry/respawn required"
@@ -1838,7 +2106,7 @@ local function updateRetryArm()
 end
 
 local function cycleSwervePayout(force)
-    if not State.swerveEnabled then return false end
+    if not (State.propulsionArmed and State.swerveEnabled) then return false end
     if not (force or State.autoPayout) then return false end
     if State.payoutInProgress then return false end
     if not force and readSwerveScore() < State.autoPayoutScore then return false end
@@ -1864,6 +2132,7 @@ local function cycleSwervePayout(force)
         local restarted = false
         for _ = 1, 6 do
             if _G.__CorsaBoostToken ~= token then return end
+            if not (State.propulsionArmed and State.swerveEnabled) then break end
             if enterSwerveCourse(false) then
                 restarted = true
                 break
@@ -1919,7 +2188,8 @@ local function captureCar(car)
         end
         Lib:Notify("Vehicle ready", car.Name, 2, "success")
 
-        if State.swerveEnabled and State.swerveAutoEnter then
+        if State.propulsionArmed and State.swerveEnabled
+            and State.swerveAutoEnter then
             task.delay(0.25, function()
                 if _G.__CorsaBoostToken == token then
                     enterSwerveCourse(false)
@@ -2272,13 +2542,16 @@ everyStat:Info(
 
 local automation = win:Tab("Automation", "settings")
 local swerve = automation:Section("Swerve autofarm", "Left", "safe-lane traffic phasing")
+swerve:Info("Propulsion starts off every time the script loads. Enable Autofarm or use Initialize from current position to start moving.")
 
 swerve:Toggle("Autofarm enabled", false, function(on)
+    State.propulsionArmed = on
     State.swerveEnabled = on
     if on then State.enabled = true end
     if not on and retryPending then
         retryRunId = retryRunId + 1
         retryPending = false
+        retryShouldResume = false
         State.retryPending = false
         State.retryState = "stopped"
     end
@@ -2291,7 +2564,7 @@ swerve:Toggle("Autofarm enabled", false, function(on)
             on and "success" or "warning")
     end
 end)
-swerve:Toggle("Initialize on car spawn", true, function(on)
+swerve:Toggle("Resume active farm on car spawn", true, function(on)
     State.swerveAutoEnter = on
 end)
 swerve:Slider("Farm target speed", 370, 10, 150, 370, " MPH", function(v)
@@ -2495,7 +2768,9 @@ swerve:Label(function()
         .. " | corrections: " .. tostring(State.groundTrackCorrections)
 end)
 swerve:Label(function()
-    if not State.swerveEnabled then return "Farm: stopped" end
+    if not (State.propulsionArmed and State.swerveEnabled) then
+        return "Farm: stopped | propulsion disarmed"
+    end
     if not currentRoot then return "Farm: waiting for car" end
     if not State.enabled then return "Farm: master controller paused" end
     return "Farm: running"
@@ -2585,6 +2860,7 @@ actions:Button("Center menu", function()
 end)
 actions:Button("Stop controller", function()
     State.enabled = false
+    State.propulsionArmed = false
     State.swerveEnabled = false
     State.antiAfk = false
     _G.__CorsaBoost = false
@@ -2689,7 +2965,7 @@ end)
 
 task.spawn(function()
     while _G.__CorsaBoostToken == token do
-        if State.swerveEnabled then
+        if State.propulsionArmed and State.swerveEnabled then
             if State.swerveAutoEnter and currentCar and currentCar.Address ~= swerveCarAddress then
                 enterSwerveCourse(false)
             end
@@ -2707,6 +2983,7 @@ task.spawn(function()
         local now = tick()
         local root = currentRoot
         local shouldDrive = State.enabled
+            and State.propulsionArmed
             and State.swerveEnabled
             and not retryPending
             and root
@@ -2798,13 +3075,14 @@ task.spawn(function()
         local ok, driveErr = pcall(function()
         local seat = currentSeat
         local root = currentRoot
-        local orientation = State.swerveEnabled and root or (seat or root)
+        local swerveDriving = State.propulsionArmed and State.swerveEnabled
+        local orientation = swerveDriving and root or (seat or root)
 
         if State.enabled and root and orientation then
             local velocity = root.AssemblyLinearVelocity
-            local forward = State.swerveEnabled and swerveForward
+            local forward = swerveDriving and swerveForward
                 or flatUnit(orientation.CFrame.LookVector)
-            local right = State.swerveEnabled and Vector3.new(1, 0, 0)
+            local right = swerveDriving and Vector3.new(1, 0, 0)
                 or flatUnit(orientation.CFrame.RightVector)
 
             if forward and right then
@@ -2822,9 +3100,10 @@ task.spawn(function()
                         velocity.Z
                     )
                     changed = true
-                elseif State.swerveEnabled then
+                elseif swerveDriving then
                     local position = root.Position
                     if position.Y < -15 then
+                        State.propulsionArmed = false
                         State.swerveEnabled = false
                         if not swerveFaulted then
                             swerveFaulted = true
@@ -2899,7 +3178,7 @@ task.spawn(function()
                     changed = true
                 end
 
-                local boosting = not retryPending and not State.swerveEnabled
+                local boosting = not retryPending and not swerveDriving
                     and State.nitroEnabled and State.nitroHeld
                 if boosting and forwardSpeed < State.maxSpeed then
                     local push = math.min(
@@ -2928,4 +3207,9 @@ task.spawn(function()
     end
 end)
 
-Lib:Notify("Corsa Controller", "Loaded successfully - press P", 4, "success")
+Lib:Notify(
+    "Corsa Controller",
+    "Loaded with propulsion off - press P to open NonUI",
+    4,
+    "success"
+)
