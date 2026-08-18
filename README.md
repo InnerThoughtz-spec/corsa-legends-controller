@@ -16,4 +16,4 @@ Version 35 replaces INS-ui with the pinned NonUI library. Loading or respawning 
 loadstring(game:HttpGet("https://raw.githubusercontent.com/InnerThoughtz-spec/corsa-legends-controller/main/ghost_driver_nonui.lua"))()
 ```
 
-Ghost Driver includes hold-only nitro, velocity stability, a traffic-guided near-miss autofarm, targeted crash-detector protection, anti-AFK, and a live A-Chassis tuner. Autofarm is always off when the script loads.
+Ghost Driver includes Left-Ctrl hold nitro, velocity stability, a traffic-guided near-miss autofarm, full AI-traffic collision ghosting, targeted crash-detector protection, anti-AFK, and a live A-Chassis tuner with throttle-only power assistance. Autofarm is always off when the script loads.

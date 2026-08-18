@@ -34,6 +34,8 @@ local State = {
     controllerEnabled = true,
     nitroEnabled = true,
     nitroHeld = false,
+    nitroKeyName = "lctrl",
+    nitroKeyCode = 0xA2,
     nitroAcceleration = 115,
     manualMaxMPH = 260,
     stabilityEnabled = true,
@@ -60,6 +62,10 @@ local State = {
     farmStatus = "stopped",
 
     crashGuard = true,
+    trafficGhost = true,
+    trafficGhostEntries = {},
+    ghostedTrafficModels = {},
+    trafficPartsGhosted = 0,
     antiAfk = true,
     lastAfk = os.clock(),
     afkStatus = "waiting",
@@ -75,6 +81,13 @@ local State = {
     tuneStatus = "ready",
     tuneProfile = "generic mapped values",
     tuneProfileAddress = nil,
+    tuneCache = nil,
+    tuneCacheCarAddress = nil,
+    powerTuneActive = false,
+    handlingTuneActive = false,
+    powerAssistAcceleration = 0,
+    handlingLateralCarry = 0.30,
+    handlingVerticalCarry = 0.30,
 }
 _G.__GhostDriverState = State
 
@@ -101,6 +114,34 @@ local function flatUnit(vector)
     local magnitude = flat.Magnitude
     if magnitude < 0.001 then return nil end
     return flat / magnitude
+end
+
+local KEY_CODES = {
+    lctrl = 0xA2,
+    rctrl = 0xA3,
+    lshift = 0xA0,
+    rshift = 0xA1,
+    space = 0x20,
+}
+
+local function keyCodeFor(name)
+    name = string.lower(tostring(name or ""))
+    if KEY_CODES[name] then return KEY_CODES[name] end
+    if #name == 1 then
+        local byte = string.byte(string.upper(name))
+        if byte then return byte end
+    end
+    return nil
+end
+
+local function keyIsDown(code, fallback)
+    if code and type(iskeypressed) == "function" then
+        local ok, active = pcall(function()
+            return iskeypressed(code)
+        end)
+        if ok then return active == true end
+    end
+    return fallback == true
 end
 
 local function notify(title, content, icon, duration)
@@ -204,6 +245,9 @@ local function refreshCar()
         State.carAddress = address
         State.seat = car and car:FindFirstChild("DriveSeat") or nil
         State.carName = car and car.Name or "not detected"
+        State.tuneCache = nil
+        State.tuneCacheCarAddress = nil
+        State.tuneProfileAddress = nil
         State.farmArmed = false
         State.farmStatus = car and "vehicle changed; waiting for route" or "waiting for vehicle"
         State.guideAddress = nil
@@ -222,6 +266,44 @@ local function refreshCar()
     end
 end
 
+local function restoreTrafficGeometry()
+    local entries = State.trafficGhostEntries
+    for i = 1, #entries do
+        local entry = entries[i]
+        pcall(function()
+            entry.part.CanCollide = entry.canCollide
+        end)
+    end
+    State.trafficGhostEntries = {}
+    State.ghostedTrafficModels = {}
+    State.trafficPartsGhosted = 0
+end
+
+local function ghostTrafficModel(model, modelAddress)
+    if not State.trafficGhost or State.ghostedTrafficModels[modelAddress] then return end
+    State.ghostedTrafficModels[modelAddress] = true
+
+    local descendants = model:GetDescendants()
+    for i = 1, #descendants do
+        local object = descendants[i]
+        local ok, canCollide = pcall(function()
+            return object.CanCollide
+        end)
+        if ok and type(canCollide) == "boolean" then
+            State.trafficGhostEntries[#State.trafficGhostEntries + 1] = {
+                part = object,
+                address = safeAddress(object),
+                modelAddress = modelAddress,
+                canCollide = canCollide,
+            }
+            pcall(function()
+                object.CanCollide = false
+            end)
+        end
+    end
+    State.trafficPartsGhosted = #State.trafficGhostEntries
+end
+
 local function refreshTraffic()
     local folder = Workspace:FindFirstChild("TrafficFolder")
     local cache = {}
@@ -231,11 +313,16 @@ local function refreshTraffic()
             local model = models[i]
             local core = model:FindFirstChild("CoreHitbox")
             if core then
+                local modelAddress = safeAddress(model)
                 cache[#cache + 1] = {
                     model = model,
                     core = core,
                     address = safeAddress(core),
+                    modelAddress = modelAddress,
                 }
+                if State.trafficGhost then
+                    ghostTrafficModel(model, modelAddress)
+                end
             end
         end
     end
@@ -330,16 +417,10 @@ end
 
 local function acquireTrafficRoute(reason)
     local seat = State.seat
-    if not seat or #State.traffic == 0 then
+    if not seat then
         State.farmArmed = false
-        State.farmStatus = "waiting for car and traffic"
-        return false, "waiting for car and traffic"
-    end
-
-    local now = os.clock()
-    if now - State.lastReacquire < State.reacquireCooldown then
-        State.farmStatus = "route recovery cooling down"
-        return false, "reacquire cooling down"
+        State.farmStatus = "waiting for vehicle"
+        return false, State.farmStatus
     end
 
     local seatPosition = readPosition(seat)
@@ -347,6 +428,20 @@ local function acquireTrafficRoute(reason)
         State.farmStatus = "seat position unavailable"
         return false, State.farmStatus
     end
+
+    if #State.traffic == 0 then
+        local direction = readDirection(seat)
+        if not direction then
+            State.farmStatus = "waiting for traffic direction"
+            return false, State.farmStatus
+        end
+        State.lastDirection = direction
+        State.farmArmed = true
+        State.farmStatus = "armed from current direction; waiting for traffic"
+        State.stallStarted = nil
+        return true, State.farmStatus
+    end
+
     local guide = nearestTraffic(seatPosition)
     if not guide then
         State.farmStatus = "no traffic route found"
@@ -358,6 +453,24 @@ local function acquireTrafficRoute(reason)
     if not position or not direction then
         State.farmStatus = "traffic route unreadable"
         return false, State.farmStatus
+    end
+
+    State.lastDirection = direction
+    State.guideAddress = guide.address
+    State.farmArmed = true
+    State.farmStatus = reason or "route acquired"
+    State.stallStarted = nil
+
+    local distance = (position - seatPosition).Magnitude
+    if distance <= 650 then
+        State.farmStatus = (reason or "route acquired") .. "; driving from current position"
+        return true, State.farmStatus
+    end
+
+    local now = os.clock()
+    if now - State.lastReacquire < State.reacquireCooldown then
+        State.farmStatus = "armed; route recovery cooling down"
+        return true, State.farmStatus
     end
 
     if State.passMode == "Right only" then
@@ -380,19 +493,14 @@ local function acquireTrafficRoute(reason)
         seat.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
         seat.CFrame = routeCFrame
     end)
+    State.lastReacquire = now
     if not ok then
-        State.farmStatus = "route placement failed: " .. tostring(writeError)
-        return false, State.farmStatus
+        State.farmStatus = "armed; placement failed: " .. tostring(writeError)
+        return true, State.farmStatus
     end
 
-    State.lastReacquire = now
-    State.lastDirection = direction
-    State.guideAddress = guide.address
-    State.farmArmed = true
-    State.farmStatus = reason or "route acquired"
-    State.stallStarted = nil
-    State.tuneStatus = reason or State.tuneStatus
-    return true, "route acquired"
+    State.farmStatus = (reason or "route acquired") .. "; placed behind traffic"
+    return true, State.farmStatus
 end
 
 local function armFarm(reason)
@@ -430,32 +538,41 @@ local function controlFarm()
     local guide, distance = chooseGuide(seatPosition)
     State.guideDistance = distance
 
-    if not guide or distance > State.reacquireDistance then
-        State.farmStatus = guide and "guide too far; recovering" or "no guide; recovering"
-        if State.autoReacquire then
-            acquireTrafficRoute("lost route")
+    local guidePosition = nil
+    local direction = State.lastDirection or readDirection(seat)
+    if guide then
+        guidePosition = readPosition(guide.core)
+        direction = readDirection(guide.core) or direction
+        if State.guideAddress ~= guide.address then
+            State.guideAddress = guide.address
+            updatePassSign()
         end
-        return
+        if distance and distance <= State.reacquireDistance then
+            State.farmStatus = "tracking live traffic"
+        elseif State.autoReacquire and os.clock() - State.lastReacquire >= State.reacquireCooldown then
+            State.farmStatus = "guide far away; repositioning"
+            acquireTrafficRoute("route recovery")
+            return
+        else
+            State.farmStatus = "guide far away; driving toward route"
+        end
+    else
+        State.farmStatus = "driving current heading; waiting for traffic"
     end
-
-    local guidePosition = readPosition(guide.core)
-    local direction = readDirection(guide.core)
-    if not guidePosition or not direction then return end
-
-    if State.guideAddress ~= guide.address then
-        State.guideAddress = guide.address
-        updatePassSign()
-    end
+    if not direction then return end
     State.lastDirection = direction
 
     local right = Vector3.new(-direction.Z, 0, direction.X)
-    local targetLine = guidePosition + right * (State.passOffset * State.passSign)
-    local lateralError = (targetLine - seatPosition):Dot(right)
-    local lateralSpeed = clamp(
-        lateralError * State.farmLateralGain,
-        -State.farmLateralLimit,
-        State.farmLateralLimit
-    )
+    local lateralSpeed = 0
+    if guidePosition then
+        local targetLine = guidePosition + right * (State.passOffset * State.passSign)
+        local lateralError = (targetLine - seatPosition):Dot(right)
+        lateralSpeed = clamp(
+            lateralError * State.farmLateralGain,
+            -State.farmLateralLimit,
+            State.farmLateralLimit
+        )
+    end
 
     local ok, velocity = pcall(function()
         return seat.AssemblyLinearVelocity
@@ -496,11 +613,22 @@ local function controlManual()
     if not forward then return end
 
     local nextVelocity = velocity
-    if State.nitroEnabled and State.nitroHeld then
+    local boostHeld = State.nitroEnabled and keyIsDown(State.nitroKeyCode, State.nitroHeld)
+    local throttleHeld = keyIsDown(0x57, false)
+    State.nitroHeld = boostHeld
+    local requestedAcceleration = 0
+    if boostHeld then
+        requestedAcceleration = requestedAcceleration + State.nitroAcceleration
+    end
+    if State.powerTuneActive and throttleHeld then
+        requestedAcceleration = requestedAcceleration + State.powerAssistAcceleration
+    end
+
+    if requestedAcceleration > 0 then
         local horizontal = Vector3.new(velocity.X, 0, velocity.Z)
         local forwardSpeed = horizontal:Dot(forward)
         local maxSpeed = State.manualMaxMPH / MPH_PER_STUD
-        local push = math.min(State.nitroAcceleration * CONTROL_DT, math.max(0, maxSpeed - forwardSpeed))
+        local push = math.min(requestedAcceleration * CONTROL_DT, math.max(0, maxSpeed - forwardSpeed))
         if push > 0 then
             nextVelocity = nextVelocity + forward * push
         end
@@ -511,10 +639,16 @@ local function controlManual()
         local forwardSpeed = horizontal:Dot(forward)
         local forwardComponent = forward * forwardSpeed
         local lateral = horizontal - forwardComponent
-        local stabilizedHorizontal = forwardComponent + lateral * State.lateralDamping
+        local lateralCarry = State.lateralDamping
+        local verticalCarry = State.verticalDamping
+        if State.handlingTuneActive then
+            lateralCarry = math.min(lateralCarry, State.handlingLateralCarry)
+            verticalCarry = math.min(verticalCarry, State.handlingVerticalCarry)
+        end
+        local stabilizedHorizontal = forwardComponent + lateral * lateralCarry
         nextVelocity = Vector3.new(
             stabilizedHorizontal.X,
-            clamp(nextVelocity.Y * State.verticalDamping, -12, 12),
+            clamp(nextVelocity.Y * verticalCarry, -12, 12),
             stabilizedHorizontal.Z
         )
     end
@@ -628,6 +762,10 @@ local HANDLING_FIELDS = {
     "TCSLimit", "FinalDrive", "ShiftUpTime", "ShiftDnTime", "BrakeForce",
 }
 
+local TuneShape = {}
+for i = 1, #POWER_FIELDS do TuneShape[POWER_FIELDS[i]] = "number" end
+for i = 1, #HANDLING_FIELDS do TuneShape[HANDLING_FIELDS[i]] = "number" end
+
 local function syncTuneProfile()
     if State.tuneProfileAddress == State.carAddress then return end
 
@@ -654,35 +792,88 @@ local function syncTuneProfile()
     State.tuneStatus = "ready - " .. profileName
 end
 
+local function updateDirectTuneAssist(source)
+    local restoring = source == "stock restore"
+    local powerSource = source == "power tune" or restoring
+    local handlingSource = source == "handling tune" or restoring
+
+    if powerSource then
+        State.powerTuneActive = not restoring
+        if restoring then
+            State.powerAssistAcceleration = 0
+        else
+            local stockHP = math.max(1, Defaults.Horsepower or 1)
+            local horsepowerGain = math.max(0, Desired.Horsepower / stockHP - 1)
+            local boost = Desired.Turbochargers * Desired.T_Boost
+                + Desired.Superchargers * Desired.S_Boost
+            State.powerAssistAcceleration = clamp(horsepowerGain * 70 + boost * 0.75, 0, 350)
+        end
+    end
+
+    if handlingSource then
+        State.handlingTuneActive = not restoring
+        if restoring then
+            State.handlingLateralCarry = 0.30
+            State.handlingVerticalCarry = 0.30
+        else
+            State.handlingLateralCarry = clamp(
+                0.16 + Desired.TCSLimit * 0.008 + Desired.CGHeight * 0.08,
+                0.16,
+                0.55
+            )
+            State.handlingVerticalCarry = clamp(0.18 + Desired.CGHeight * 0.15, 0.18, 0.55)
+        end
+    end
+end
+
+local function buildTuneCache()
+    if State.tuneCache and State.tuneCacheCarAddress == State.carAddress then
+        return State.tuneCache
+    end
+    if type(findgc) ~= "function" then return nil end
+
+    local ok, cache = pcall(function()
+        return findgc("IdleThrottle", TuneShape)
+    end)
+    if ok and type(cache) == "table" and #cache > 0 then
+        State.tuneCache = cache
+        State.tuneCacheCarAddress = State.carAddress
+        return cache
+    end
+    State.tuneCache = nil
+    State.tuneCacheCarAddress = nil
+    return nil
+end
+
 local function applyTuneFields(fields, source)
     if State.tuneBusy then
         notify("Tuner busy", "Wait for the current tuning pass to finish.", "info", 3)
         return
     end
     syncTuneProfile()
-    if type(setgc) ~= "function" then
-        State.tuneStatus = "setgc unavailable"
-        notify("Tuner unavailable", "This executor does not expose setgc.", "x", 5)
-        return
-    end
+    updateDirectTuneAssist(source)
 
     State.tuneBusy = true
-    State.tuneStatus = "applying " .. source
-    notify("Ghost Driver tuner", "Applying changed values; the live table scan can take a moment.", "settings", 5)
+    State.tuneStatus = "assist active; locating A-Chassis table"
+    notify("Ghost Driver tuner", "Direct tune assist is active. Locating the precise A-Chassis table once.", "settings", 5)
 
     task.spawn(function()
         local changedFields = 0
         local matchedTables = 0
         local failed = 0
+        local cache = buildTuneCache()
         for i = 1, #fields do
             if _G.__GhostDriverToken ~= token then break end
             local key = fields[i]
             local oldValue = Applied[key]
             local newValue = Desired[key]
             if newValue ~= nil and oldValue ~= nil and newValue ~= oldValue then
-                local ok, result = pcall(function()
-                    return setgc(key, newValue, oldValue)
-                end)
+                local ok, result = false, 0
+                if cache and type(applygc) == "function" then
+                    ok, result = pcall(function()
+                        return applygc(cache, key, newValue)
+                    end)
+                end
                 local matches = ok and tonumber(result) or 0
                 if matches and matches > 0 then
                     Applied[key] = newValue
@@ -695,10 +886,15 @@ local function applyTuneFields(fields, source)
             end
         end
         State.tuneBusy = false
-        State.tuneStatus = string.format("%s: %d changed, %d unmatched", source, changedFields, failed)
+        State.tuneStatus = string.format(
+            "%s: assist on, %d memory values changed, %d unmatched",
+            source,
+            changedFields,
+            failed
+        )
         notify(
             "Tuning finished",
-            string.format("%d values changed across %d live matches. Respawn the car if a cached value does not update immediately.", changedFields, matchedTables),
+            string.format("Direct tune assist is live; %d A-Chassis values changed across %d precise matches.", changedFields, matchedTables),
             "check",
             6
         )
@@ -756,11 +952,21 @@ DriveTab:Toggle({
 })
 DriveTab:Keybind({
     Title = "Nitro hold key",
-    Desc = "Hold Left Shift while driving.",
-    Default = "leftshift",
+    Desc = "Default is Left Ctrl; input is polled directly for reliability.",
+    Default = "lctrl",
     Mode = "hold",
-    Callback = function(_, active)
-        State.nitroHeld = active == true
+    Callback = function(key, active)
+        if key then
+            local name = string.lower(tostring(key))
+            local code = keyCodeFor(name)
+            if code then
+                State.nitroKeyName = name
+                State.nitroKeyCode = code
+            end
+        end
+        if type(active) == "boolean" then
+            State.nitroHeld = active
+        end
     end,
 })
 DriveTab:Slider({
@@ -818,7 +1024,7 @@ local DriveStatus = DriveTab:Paragraph({
 })
 
 FarmTab:Section({Title = "Traffic near-miss farm"})
-FarmTab:Toggle({
+local FarmToggle = FarmTab:Toggle({
     Title = "Autofarm",
     Desc = "Explicitly arms route placement and traffic-guided propulsion.",
     Default = false,
@@ -842,12 +1048,15 @@ FarmTab:Toggle({
     end,
 })
 FarmTab:Button({
-    Title = "Acquire traffic route now",
-    Desc = "One controlled placement behind the nearest live traffic car.",
+    Title = "Start or reacquire now",
+    Desc = "Arms immediately; only repositions when traffic is more than 650 studs away.",
     Callback = function()
-        State.farmEnabled = true
         State.lastReacquire = -100
-        task.spawn(function() armFarm("manual route acquire") end)
+        if not State.farmEnabled then
+            FarmToggle:Set(true)
+        else
+            task.spawn(function() armFarm("manual route acquire") end)
+        end
     end,
 })
 FarmTab:Slider({
@@ -991,12 +1200,12 @@ PowerTab:Slider({
 })
 PowerTab:Button({
     Title = "Apply power tune",
-    Desc = "Changes only values that differ from the mapped stock table.",
+    Desc = "Applies the A-Chassis table and immediate W-key power assistance.",
     Callback = function() applyTuneFields(POWER_FIELDS, "power tune") end,
 })
 local PowerStatus = PowerTab:Paragraph({
     Title = "Tuner: ready",
-    Desc = "Mapped from the live A-Chassis tune. Idle throttle stays stock so the car never self-accelerates.",
+    Desc = "Power assistance only runs while W is held. Idle throttle stays stock, so applying a tune cannot self-accelerate.",
     Icon = "info",
 })
 
@@ -1118,7 +1327,7 @@ HandlingTab:Button({
 })
 HandlingTab:Paragraph({
     Title = "A-Chassis note",
-    Desc = "Power values usually update live. Steering, brakes, and weight may be cached when the drive script starts; respawn the car after applying those values.",
+    Desc = "Grip assistance updates immediately. Cached steering, brakes, and weight values may still need a vehicle respawn.",
     Icon = "info",
 })
 
@@ -1138,6 +1347,19 @@ SafetyTab:Toggle({
     end,
 })
 SafetyTab:Toggle({
+    Title = "Ghost all AI traffic geometry",
+    Desc = "Disables collision on every part of each current and newly spawned traffic model.",
+    Default = true,
+    Callback = function(on)
+        State.trafficGhost = on
+        if on then
+            refreshTraffic()
+        else
+            restoreTrafficGeometry()
+        end
+    end,
+})
+SafetyTab:Toggle({
     Title = "Anti-AFK",
     Desc = "One mouse click every 19 minutes; it never moves the pointer or presses a drive key.",
     Default = true,
@@ -1150,9 +1372,9 @@ SafetyTab:Toggle({
 SafetyTab:Button({
     Title = "Stop autofarm now",
     Callback = function()
-        State.farmEnabled = false
-        State.farmArmed = false
-        State.farmStatus = "stopped"
+        if State.farmEnabled then
+            FarmToggle:Set(false)
+        end
         State.nitroHeld = false
         notify("Ghost Driver", "Autofarm and nitro input stopped.", "pause", 3)
     end,
@@ -1171,6 +1393,7 @@ local function stopController(destroyUI)
     State.farmStatus = "unloaded"
     State.nitroHeld = false
     restoreCrashDetectors()
+    restoreTrafficGeometry()
     if _G.__GhostDriverToken == token then
         _G.__GhostDriverToken = token + 1
     end
@@ -1253,10 +1476,12 @@ task.spawn(function()
         pcall(function()
             DriveStatus:SetTitle("Vehicle: " .. State.carName)
             DriveStatus:SetDesc(string.format(
-                "Speed: %.0f MPH | Nitro: %s | Stability: %s\nNo propulsion is applied unless nitro is held or autofarm is armed.",
+                "Speed: %.0f MPH | Nitro (%s): %s | Stability: %s\nTune assist: %s; propulsion requires W, the nitro key, or armed autofarm.",
                 mph,
+                State.nitroKeyName,
                 State.nitroHeld and "held" or "idle",
-                State.stabilityEnabled and "on" or "off"
+                State.stabilityEnabled and "on" or "off",
+                State.powerTuneActive and (tostring(math.floor(State.powerAssistAcceleration)) .. " studs/s2") or "off"
             ))
         end)
         pcall(function()
@@ -1273,14 +1498,15 @@ task.spawn(function()
         pcall(function()
             PowerStatus:SetTitle("Tuner: " .. State.tuneStatus)
             PowerStatus:SetDesc(
-                "Stock matcher: " .. State.tuneProfile .. ". Values change only after Apply; idle throttle remains stock at 3."
+                "Stock matcher: " .. State.tuneProfile .. ". Apply enables throttle-only assistance and the precise A-Chassis memory update."
             )
         end)
         pcall(function()
             SafetyStatus:SetTitle("Safety: " .. (State.crashGuard and "guarded" or "stock"))
             SafetyStatus:SetDesc(string.format(
-                "Crash detectors: %d | Anti-AFK: %s | next click in %dm %02ds",
+                "Crash detectors: %d | Traffic parts ghosted: %d | Anti-AFK: %s\nnext click in %dm %02ds",
                 #State.collisionEntries,
+                State.trafficPartsGhosted,
                 State.antiAfk and State.afkStatus or "disabled",
                 math.floor(afkRemaining / 60),
                 math.floor(afkRemaining % 60)
@@ -1299,5 +1525,5 @@ notify(
 )
 
 print("[Ghost Driver] NonUI controller loaded; autofarm is OFF.")
-print("[Ghost Driver] Hold Left Shift for nitro. Press P for UI.")
+print("[Ghost Driver] Hold Left Ctrl for nitro. Press P for UI.")
 print("[Ghost Driver] Stop with: _G.__GhostDriverStop()")
