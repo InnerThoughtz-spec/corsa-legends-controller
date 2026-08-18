@@ -57,6 +57,7 @@ local State = {
     guideAddress = nil,
     guideDistance = nil,
     lastDirection = nil,
+    farmStatus = "stopped",
 
     crashGuard = true,
     antiAfk = true,
@@ -204,6 +205,7 @@ local function refreshCar()
         State.seat = car and car:FindFirstChild("DriveSeat") or nil
         State.carName = car and car.Name or "not detected"
         State.farmArmed = false
+        State.farmStatus = car and "vehicle changed; waiting for route" or "waiting for vehicle"
         State.guideAddress = nil
         State.lastDirection = nil
         if car then
@@ -330,22 +332,33 @@ local function acquireTrafficRoute(reason)
     local seat = State.seat
     if not seat or #State.traffic == 0 then
         State.farmArmed = false
+        State.farmStatus = "waiting for car and traffic"
         return false, "waiting for car and traffic"
     end
 
     local now = os.clock()
     if now - State.lastReacquire < State.reacquireCooldown then
+        State.farmStatus = "route recovery cooling down"
         return false, "reacquire cooling down"
     end
 
     local seatPosition = readPosition(seat)
-    if not seatPosition then return false, "seat position unavailable" end
+    if not seatPosition then
+        State.farmStatus = "seat position unavailable"
+        return false, State.farmStatus
+    end
     local guide = nearestTraffic(seatPosition)
-    if not guide then return false, "no traffic route found" end
+    if not guide then
+        State.farmStatus = "no traffic route found"
+        return false, State.farmStatus
+    end
 
     local position = readPosition(guide.core)
     local direction = readDirection(guide.core)
-    if not position or not direction then return false, "traffic route unreadable" end
+    if not position or not direction then
+        State.farmStatus = "traffic route unreadable"
+        return false, State.farmStatus
+    end
 
     if State.passMode == "Right only" then
         State.passSign = 1
@@ -357,16 +370,26 @@ local function acquireTrafficRoute(reason)
     local target = position - direction * 45 + right * (State.passOffset * State.passSign)
     target = Vector3.new(target.X, position.Y - 1.55, target.Z)
 
-    local ok = pcall(function()
+    local routeCFrame = CFrame.new(
+        target.X, target.Y, target.Z,
+        right.X, 0, -direction.X,
+        0, 1, 0,
+        right.Z, 0, -direction.Z
+    )
+    local ok, writeError = pcall(function()
         seat.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-        seat.CFrame = CFrame.new(target, target + direction)
+        seat.CFrame = routeCFrame
     end)
-    if not ok then return false, "route placement failed" end
+    if not ok then
+        State.farmStatus = "route placement failed: " .. tostring(writeError)
+        return false, State.farmStatus
+    end
 
     State.lastReacquire = now
     State.lastDirection = direction
     State.guideAddress = guide.address
     State.farmArmed = true
+    State.farmStatus = reason or "route acquired"
     State.stallStarted = nil
     State.tuneStatus = reason or State.tuneStatus
     return true, "route acquired"
@@ -408,6 +431,7 @@ local function controlFarm()
     State.guideDistance = distance
 
     if not guide or distance > State.reacquireDistance then
+        State.farmStatus = guide and "guide too far; recovering" or "no guide; recovering"
         if State.autoReacquire then
             acquireTrafficRoute("lost route")
         end
@@ -810,6 +834,7 @@ FarmTab:Toggle({
             end)
         else
             State.farmArmed = false
+            State.farmStatus = "stopped"
             State.guideAddress = nil
             State.stallStarted = nil
             notify("Ghost Driver", "Autofarm stopped; vehicle propulsion released.", "pause", 3)
@@ -1127,6 +1152,7 @@ SafetyTab:Button({
     Callback = function()
         State.farmEnabled = false
         State.farmArmed = false
+        State.farmStatus = "stopped"
         State.nitroHeld = false
         notify("Ghost Driver", "Autofarm and nitro input stopped.", "pause", 3)
     end,
@@ -1142,6 +1168,7 @@ local function stopController(destroyUI)
     State.running = false
     State.farmEnabled = false
     State.farmArmed = false
+    State.farmStatus = "unloaded"
     State.nitroHeld = false
     restoreCrashDetectors()
     if _G.__GhostDriverToken == token then
@@ -1235,11 +1262,12 @@ task.spawn(function()
         pcall(function()
             FarmStatus:SetTitle("Autofarm: " .. farmWord)
             FarmStatus:SetDesc(string.format(
-                "Traffic: %d | Guide: %s | Best combo: %d | Best points: %d\nCrash guard keeps the side scoring hitboxes intact.",
+                "Traffic: %d | Guide: %s | Best combo: %d | Best points: %d\n%s | Crash guard keeps the side scoring hitboxes intact.",
                 State.trafficCount,
                 guideText,
                 bestCombo,
-                bestPoints
+                bestPoints,
+                State.farmStatus
             ))
         end)
         pcall(function()
