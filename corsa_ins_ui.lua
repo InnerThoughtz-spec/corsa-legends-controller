@@ -26,6 +26,35 @@ end
 -- deliberately avoided. This revision already cleans up hidden images itself.
 local INS_UI_URL = "https://raw.githubusercontent.com/neaxusxgod-png/INS-ui/6c9f402d87feb12c598b4f81727d918eceb3869c/uilib.min.lua"
 local uiSource = game:HttpGet(INS_UI_URL)
+
+-- Standard exploit Drawing APIs use 1 as opaque; Matcha uses 0 as opaque.
+-- Adapt the eight writes in this pinned INS-ui revision while leaving its
+-- logical opacity and visibility calculations untouched.
+local objectTransparencyCount
+local iconTransparencyCount
+local pictureTransparencyCount
+uiSource, objectTransparencyCount = string.gsub(
+    uiSource,
+    "Object%.Transparency = Shade",
+    "Object.Transparency = 1 - Shade"
+)
+uiSource, iconTransparencyCount = string.gsub(
+    uiSource,
+    "Image%.Transparency = Shade",
+    "Image.Transparency = 1 - Shade"
+)
+uiSource, pictureTransparencyCount = string.gsub(
+    uiSource,
+    "Image%.Transparency = transparency",
+    "Image.Transparency = 1 - transparency"
+)
+assert(
+    objectTransparencyCount == 6
+        and iconTransparencyCount == 1
+        and pictureTransparencyCount == 1,
+    "Pinned INS-ui transparency adapter did not match"
+)
+
 local uiLoader = assert(loadstring(uiSource), "INS-ui source did not compile")
 local Lib = uiLoader() or INSui
 local MPH_PER_STUD_PER_SECOND = 0.626342
@@ -227,14 +256,14 @@ local groundLockToggle
 
 local win = Lib:CreateWindow({
     title = "Corsa Controller",
-    subtitle = "pinned INS-ui + self-healing propulsion v32",
+    subtitle = "Matcha-native UI + self-healing propulsion v33",
     size = Vector2.new(720, 540),
     menuKey = "p",
-    configName = "corsa-controller-v32",
+    configName = "corsa-controller-v33",
     configFolder = "corsa-controller",
     accentA = Color3.fromRGB(84, 168, 255),
     accentB = Color3.fromRGB(105, 255, 202),
-    backgroundEffect = "Rain",
+    backgroundEffect = "Off",
     backgroundEffectColor = Color3.fromRGB(84, 168, 255),
     opacity = 0.96,
     rounding = 1.2,
