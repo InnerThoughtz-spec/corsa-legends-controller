@@ -72,6 +72,8 @@ local State = {
     collisionEntries = {},
     tuneBusy = false,
     tuneStatus = "ready",
+    tuneProfile = "generic mapped values",
+    tuneProfileAddress = nil,
 }
 _G.__GhostDriverState = State
 
@@ -498,7 +500,7 @@ local function controlManual()
     end)
 end
 
-local Defaults = {
+local BaseDefaults = {
     Horsepower = 450,
     Turbochargers = 2,
     T_Boost = 7,
@@ -522,8 +524,50 @@ local Defaults = {
     BrakeForce = 3000,
 }
 
+local Defaults = {}
 local Applied = {}
-for key, value in pairs(Defaults) do Applied[key] = value end
+for key, value in pairs(BaseDefaults) do
+    Defaults[key] = value
+    Applied[key] = value
+end
+
+local TuneProfiles = {
+    ["Wulfbrecht RZ7"] = {
+        Horsepower = 450,
+        Weight = 3239,
+    },
+    ["Weinchen V20"] = {
+        Horsepower = 800,
+        Weight = 3439,
+    },
+    ["Weinchen V80"] = {
+        Horsepower = 900,
+        Weight = 3939,
+    },
+    ["Weinchen V120"] = {
+        Horsepower = 550,
+        Turbochargers = 1,
+        Weight = 3360,
+        FinalDrive = 2.5,
+    },
+    ["Eisenhardt G43"] = {
+        Horsepower = 700,
+        Weight = 3939,
+    },
+    ["Voss RT8"] = {
+        Horsepower = 1000,
+        Weight = 4559,
+        BrakeForce = 5000,
+    },
+    ["Rangy Helly"] = {
+        Horsepower = 1300,
+        Turbochargers = 0,
+        Superchargers = 1,
+        Weight = 5575,
+        FinalDrive = 3.2,
+        BrakeForce = 9000,
+    },
+}
 
 local Desired = {
     Horsepower = 1200,
@@ -560,11 +604,38 @@ local HANDLING_FIELDS = {
     "TCSLimit", "FinalDrive", "ShiftUpTime", "ShiftDnTime", "BrakeForce",
 }
 
+local function syncTuneProfile()
+    if State.tuneProfileAddress == State.carAddress then return end
+
+    for key, value in pairs(BaseDefaults) do
+        Defaults[key] = value
+    end
+
+    local profileName = "generic mapped values"
+    for carName, overrides in pairs(TuneProfiles) do
+        if string.find(State.carName or "", carName, 1, true) then
+            profileName = carName
+            for key, value in pairs(overrides) do
+                Defaults[key] = value
+            end
+            break
+        end
+    end
+
+    for key, value in pairs(Defaults) do
+        Applied[key] = value
+    end
+    State.tuneProfileAddress = State.carAddress
+    State.tuneProfile = profileName
+    State.tuneStatus = "ready - " .. profileName
+end
+
 local function applyTuneFields(fields, source)
     if State.tuneBusy then
         notify("Tuner busy", "Wait for the current tuning pass to finish.", "info", 3)
         return
     end
+    syncTuneProfile()
     if type(setgc) ~= "function" then
         State.tuneStatus = "setgc unavailable"
         notify("Tuner unavailable", "This executor does not expose setgc.", "x", 5)
@@ -611,6 +682,7 @@ local function applyTuneFields(fields, source)
 end
 
 local function restoreTune()
+    syncTuneProfile()
     for key, value in pairs(Defaults) do Desired[key] = value end
     local fields = {}
     for key in pairs(Defaults) do fields[#fields + 1] = key end
@@ -899,7 +971,7 @@ PowerTab:Button({
 })
 local PowerStatus = PowerTab:Paragraph({
     Title = "Tuner: ready",
-    Desc = "Mapped from the live Wulfbrecht RZ7 A-Chassis tune. Idle throttle stays stock so the car never self-accelerates.",
+    Desc = "Mapped from the live A-Chassis tune. Idle throttle stays stock so the car never self-accelerates.",
     Icon = "info",
 })
 
@@ -1149,6 +1221,7 @@ task.spawn(function()
         local guideText = State.guideDistance and (tostring(math.floor(State.guideDistance)) .. " studs") or "none"
         local farmWord = State.farmEnabled and (State.farmArmed and "armed" or "waiting") or "stopped"
         local afkRemaining = math.max(0, AFK_INTERVAL - (os.clock() - State.lastAfk))
+        syncTuneProfile()
 
         pcall(function()
             DriveStatus:SetTitle("Vehicle: " .. State.carName)
@@ -1172,7 +1245,7 @@ task.spawn(function()
         pcall(function()
             PowerStatus:SetTitle("Tuner: " .. State.tuneStatus)
             PowerStatus:SetDesc(
-                "Mapped A-Chassis values are changed only after an Apply button. Idle throttle remains stock at 3."
+                "Stock matcher: " .. State.tuneProfile .. ". Values change only after Apply; idle throttle remains stock at 3."
             )
         end)
         pcall(function()
