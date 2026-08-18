@@ -21,47 +21,12 @@ if _G.__CorsaUI then
     pcall(function() _G.__CorsaUI:Destroy() end)
 end
 
-local uiSource = game:HttpGet(
-    "https://raw.githubusercontent.com/neaxusxgod-png/INS-ui/main/uilib.lua"
-)
-
-local imageCleanupHook = [[
-function ui:HideWindowImages()
-    local function hideImage(img)
-        if img then pcall(function() img.Visible = false end) end
-    end
-
-    for _, tab in ipairs(ProjectState.tabs or {}) do
-        hideImage(tab._img)
-        hideImage(tab._imgA)
-        for _, sub in ipairs(tab.subs or {}) do
-            hideImage(sub._img)
-            hideImage(sub._imgA)
-        end
-        for _, section in ipairs(tab.sections or {}) do
-            for _, item in ipairs(section.items or {}) do
-                hideImage(item._img)
-                hideImage(item._ddImg)
-            end
-        end
-    end
-
-    hideImage(ProjectState._gearImg)
-    hideImage(ProjectState.bgImg)
-    hideImage(ProjectState.avatarImg)
-    hideImage(ProjectState.logoImg)
-    hideImage(ProjectState.iconImg)
-    return self
-end
-]]
-
-local patchedSource, hookCount = string.gsub(uiSource, "function ui:Destroy%(%)", function()
-    return imageCleanupHook .. "\nfunction ui:Destroy()"
-end, 1)
-assert(hookCount == 1, "INS-ui cleanup hook could not be installed")
-uiSource = patchedSource
-
-local uiLoader = assert(loadstring(uiSource))
+-- Pin the known-good upstream revision. INS-ui renamed its implementation and
+-- source file in August 2026, so rewriting its internals by function name is
+-- deliberately avoided. This revision already cleans up hidden images itself.
+local INS_UI_URL = "https://raw.githubusercontent.com/neaxusxgod-png/INS-ui/6c9f402d87feb12c598b4f81727d918eceb3869c/uilib.min.lua"
+local uiSource = game:HttpGet(INS_UI_URL)
+local uiLoader = assert(loadstring(uiSource), "INS-ui source did not compile")
 local Lib = uiLoader() or INSui
 local MPH_PER_STUD_PER_SECOND = 0.626342
 local SWERVE_MAX_MPH = 370
@@ -262,10 +227,10 @@ local groundLockToggle
 
 local win = Lib:CreateWindow({
     title = "Corsa Controller",
-    subtitle = "self-healing propulsion + score-safe traffic v31",
+    subtitle = "pinned INS-ui + self-healing propulsion v32",
     size = Vector2.new(720, 540),
     menuKey = "p",
-    configName = "corsa-controller-v31",
+    configName = "corsa-controller-v32",
     configFolder = "corsa-controller",
     accentA = Color3.fromRGB(84, 168, 255),
     accentB = Color3.fromRGB(105, 255, 202),
@@ -282,15 +247,6 @@ local win = Lib:CreateWindow({
 })
 
 _G.__CorsaUI = win
-
-task.spawn(function()
-    while _G.__CorsaBoostToken == token do
-        if not win:IsOpen() then
-            win:HideWindowImages()
-        end
-        task.wait(0.05)
-    end
-end)
 
 local function flatUnit(v)
     local flat = Vector3.new(v.X, 0, v.Z)

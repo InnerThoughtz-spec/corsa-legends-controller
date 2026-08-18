@@ -8,4 +8,4 @@ INS-ui speed, grip, suspension, high-speed stability, and Swerve automation cont
 loadstring(game:HttpGet("https://raw.githubusercontent.com/InnerThoughtz-spec/corsa-legends-controller/main/corsa_ins_ui.lua"))()
 ```
 
-Version 31 restores score-producing traffic passes by despawning only an imminent car in the player's current lane. It also refreshes rebuilt chassis references after Retry and automatically recovers a stationary farm without disturbing an active score. Adjacent traffic stays alive for near-miss scoring, while generated `SideTrash` meshes and proxies remain non-collidable.
+Version 32 pins the current INS-ui revision and removes the obsolete cleanup-source patch that broke when the library renamed its implementation. It retains score-safe traffic passes, rebuilt-chassis recovery after Retry, stationary-farm recovery, and non-collidable generated `SideTrash` piles.
